@@ -31,6 +31,7 @@ from hyper_parallel.data.indexed.indexed_pretrain_dataset import (
     GPTFromMRDataset,
     MockGPTDataset,
 )
+from hyper_parallel.data.indexed.indexed_sft_dataset import build_sft_dataset_splits
 from hyper_parallel.data.indexed.indexed_split_builder import IndexedDatasetSplitBuilder
 from hyper_parallel.data.parallel import DataLoaderParallelContext
 
@@ -137,21 +138,26 @@ class IndexedPretrainDatasetBuilder:
     def _build_instruction_dataset_splits(self, config: GPTDatasetConfig) -> DatasetSplits:
         """Build packed instruction splits through the configured implementation.
 
-        The concrete packed-dataset implementation remains outside this provider.
+        A caller may provide a custom builder for compatibility with existing
+        integrations.  Pure-text SFT files emitted by the offline converter
+        use the built-in paired Indexed Dataset reader by default.
 
         Raises:
-            NotImplementedError: If no instruction Dataset builder is configured.
             ValueError: If the configured builder does not return three splits.
         """
         instruction_builder = self.data_config.get("instruction_dataset_builder")
-        if not callable(instruction_builder):
-            raise NotImplementedError(
-                "is_instruction_dataset=True requires an instruction_dataset_builder"
-            )
+        custom_builder = callable(instruction_builder)
+        if not custom_builder:
+            instruction_builder = build_sft_dataset_splits
 
         instruction_split_builder: InstructionSplitBuilder = instruction_builder
 
         data_prefix = config.blend if config.blend is not None else self.data_path
+        if not custom_builder:
+            if isinstance(data_prefix, Sequence) and len(data_prefix) == 1:
+                data_prefix = data_prefix[0]
+            if not isinstance(data_prefix, str):
+                raise ValueError("Built-in SFT Dataset requires one unweighted data prefix")
         datasets = instruction_split_builder(
             data_prefix=data_prefix,
             splits_string=config.split,

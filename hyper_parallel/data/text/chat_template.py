@@ -221,7 +221,12 @@ class ChatTemplate(ABC):
             logger.warning("Failed to save tokenizer.")
 
     @abstractmethod
-    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+    def encode_messages(
+            self,
+            messages: Sequence[Dict[str, str]],
+            max_seq_len: int = 8192,
+            append_eos: bool = True,
+    ) -> Dict[str, List[int]]:
         """
         Encodes messages to a dictionary of input_ids, attention_mask, and labels.
         """
@@ -237,19 +242,26 @@ class ChatTemplate(ABC):
 class DefaultTemplate(ChatTemplate):
     """Render each message as ``Role: content`` followed by the EOS token."""
 
-    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+    def encode_messages(
+            self,
+            messages: Sequence[Dict[str, str]],
+            max_seq_len: int = 8192,
+            append_eos: bool = True,
+    ) -> Dict[str, List[int]]:
         """Encode messages into input_ids, attention_mask, and loss-masked labels.
 
         Args:
             messages: Conversation records with ``role``, ``content``, and ``loss_mask`` fields.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
+            append_eos: Whether to include the tokenizer EOS token in rendered messages.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
         """
         input_ids, attention_mask, labels = [], [], []
         for message in messages:
-            content_str = message["role"].title() + ": " + message["content"].strip() + self.tokenizer.eos_token + "\n"
+            eos_token = self.tokenizer.eos_token if append_eos else ""
+            content_str = message["role"].title() + ": " + message["content"].strip() + eos_token + "\n"
             content_ids = self.tokenizer.encode(content_str, add_special_tokens=False)
             input_ids += content_ids
             attention_mask += [1] * len(content_ids)
@@ -297,6 +309,7 @@ class TokenizerTemplate(ChatTemplate):
             self,
             messages: Sequence[Dict[str, str]],
             max_seq_len: int = 8192,
+            append_eos: bool = True,
     ) -> Dict[str, List[int]]:
         """Encode messages with the tokenizer chat template and mask non-assistant loss.
 
@@ -306,6 +319,7 @@ class TokenizerTemplate(ChatTemplate):
         Args:
             messages: Conversation records with ``role``, ``content``, and optional ``loss_mask``.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
+            append_eos: Whether to expose the tokenizer EOS token to the chat template.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
@@ -323,6 +337,7 @@ class TokenizerTemplate(ChatTemplate):
                 tokenize=True,
                 add_generation_prompt=False,
                 return_dict=True,
+                **({} if append_eos else {"eos_token": ""}),
             )
             current_ids = encoded["input_ids"]
             current_length = len(current_ids)
@@ -423,12 +438,18 @@ class GptOssTokenizerTemplate(TokenizerTemplate):
 class Llama2Template(ChatTemplate):
     """Render messages with the Llama-2 [INST]/<<SYS>> prompt format."""
 
-    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+    def encode_messages(
+            self,
+            messages: Sequence[Dict[str, str]],
+            max_seq_len: int = 8192,
+            append_eos: bool = True,
+    ) -> Dict[str, List[int]]:
         """Encode messages into input_ids, attention_mask, and loss-masked labels.
 
         Args:
             messages: Conversation records with ``role``, ``content``, and ``loss_mask`` fields.
             max_seq_len: Maximum sequence length kept from the end of the encoding.
+            append_eos: Whether to include the tokenizer EOS token in assistant messages.
 
         Returns:
             Model inputs with input_ids, attention_mask, and labels.
@@ -443,7 +464,8 @@ class Llama2Template(ChatTemplate):
             elif message["role"] == "user":
                 content_str = self.tokenizer.bos_token + "[INST] " + message["content"].strip() + " [/INST]"
             elif message["role"] == "assistant":
-                content_str = " " + message["content"].strip() + " " + self.tokenizer.eos_token
+                eos_token = self.tokenizer.eos_token if append_eos else ""
+                content_str = " " + message["content"].strip() + " " + eos_token
             elif message["role"] == "tool":
                 content_str = self.tokenizer.bos_token + "[TOOL] " + message["content"].strip() + " [/TOOL]"
             else:

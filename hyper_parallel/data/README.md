@@ -19,8 +19,8 @@ CP 切分 + TP 广播 + attention 元数据
 (model_inputs, loss_inputs)
 ```
 
-本模块不负责模型构建、优化器、训练调度或 checkpoint 存储。LLM 的 Online 和 Indexed
-路径已实现；Omni 目前只保留接口，还没有可用的 Online/Offline Dataset 实现。
+本模块不负责模型构建、优化器、训练调度或 checkpoint 存储。LLM 的 Online、普通 Indexed 和纯文本
+SFT Offline 路径已实现；Omni 目前只保留接口，还没有可用的 Online/Offline Dataset 实现。
 
 建议按以下顺序阅读：
 
@@ -235,6 +235,33 @@ alignment = cp_size              # 未开启 TP sequence parallel
 记入 `cu_seq_lens`，但不参与 loss。
 
 ## 5. LLM Indexed Dataset
+
+### 5.1 纯文本 SFT Offline
+
+`hyper_parallel.data.tools.offline_sft` 将 Alpaca/Instruction、Prompt-Completion、标准 `messages` 和
+ShareGPT `conversations` 归一化为 canonical record，再用 tokenizer/chat template 生成未 shift 的
+`input_ids` 与 assistant/completion-only `labels`。启用 packing 时，输出固定长度的双 Indexed Dataset：
+
+```text
+<prefix>_<split>_input_ids.bin/.idx
+<prefix>_<split>_labels.bin/.idx
+<prefix>_manifest.json
+```
+
+示例：
+
+```bash
+python -m hyper_parallel.data.tools.offline_sft \
+  --input train.jsonl --output-prefix ./sft \
+  --tokenizer /path/to/tokenizer --sequence-length 4096
+```
+
+Manifest 会记录并校验 tokenizer、chat template、EOS 设置、`labels_are_shifted=false`、`ignore_index`、packing
+和序列长度；同一 prefix 下的各 split 必须遵守相同转换契约。训练侧设置
+`is_instruction_dataset: true` 后，Indexed builder 默认读取 `SFTIndexedDataset`，不会改变普通预训练路径。
+SFT 的 `labels` 按 HF 约定与 `input_ids` 等长且未 shift，因此同一份训练配置必须显式设置
+`labels_are_shifted: false`；否则 Indexed batch 会把 labels 当作已右移的 `shift_labels` 传给 loss。
+读取器按 Indexed batch 的既有契约返回 `tokens`、`labels` 和 `loss_mask`。
 
 Indexed 路径使用共同前缀的两个文件：
 
