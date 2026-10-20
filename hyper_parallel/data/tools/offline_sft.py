@@ -445,6 +445,138 @@ def write_sft_dataset(
     return manifest
 
 
+def _as_int_array(
+        record: Mapping[str, Any], field: str, *, dtype: Any = np.int32, allow_scalar: bool = False
+) -> np.ndarray:
+    """Convert one tokenized HF field to a one-dimensional integer array."""
+    if field not in record:
+        raise ValueError(f"Tokenized SFT record is missing {field!r}")
+    try:
+        value = np.asarray(record[field], dtype=dtype)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Tokenized SFT field {field!r} must be an integer sequence") from exc
+    if value.ndim == 0 and allow_scalar:
+        value = value.reshape(1)
+    if value.ndim != 1:
+        raise ValueError(f"Tokenized SFT field {field!r} must be one-dimensional")
+    return value
+
+
+def write_tokenized_sft_dataset(
+        records: Iterable[Mapping[str, Any]],
+        *,
+        output_prefix: str,
+        sequence_length: int,
+        split: str = "train",
+        pad_token_id: int = 0,
+        ignore_index: int = IGNORE_INDEX,
+) -> dict[str, Any]:
+    """Write an already-tokenized/packed HF SFT dataset.
+
+    This accepts the common generated Dataset schema with ``input_ids``,
+    ``labels``, ``cu_seqlens`` and ``real_len``.  No tokenizer or chat
+    template is applied; labels and packed boundaries are preserved.
+    """
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    if not split or any(char in split for char in "/\\"):
+        raise ValueError("split must be a simple non-empty name")
+    output = Path(output_prefix).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    split_prefix = output.with_name(f"{output.name}_{split}")
+    manifest_file = _manifest_path(output)
+    previous = json.loads(manifest_file.read_text(encoding="utf-8")) if manifest_file.is_file() else None
+    contract = {
+        "format": "hyperparallel_sft_v1",
+        "source_format": "tokenized",
+        "loss_mode": "precomputed",
+        "packing": True,
+        "labels_are_shifted": False,
+        "ignore_index": int(ignore_index),
+        "sequence_length": int(sequence_length),
+        "pad_token_id": int(pad_token_id),
+        "tokenized_fields": ["input_ids", "labels", "cu_seqlens", "real_len"],
+        "boundaries": True,
+    }
+    if previous is not None:
+        for field, value in contract.items():
+            if field in previous and previous[field] != value:
+                raise ValueError(f"Existing SFT manifest field {field!r} conflicts with the new split")
+
+    builders = {
+        "input_ids": indexed_dataset.IndexedDatasetBuilder(str(split_prefix) + "_input_ids.bin", dtype=np.int32),
+        "labels": indexed_dataset.IndexedDatasetBuilder(str(split_prefix) + "_labels.bin", dtype=np.int32),
+        "cu_seqlens": indexed_dataset.IndexedDatasetBuilder(
+            str(split_prefix) + "_cu_seqlens.bin", dtype=np.int32
+        ),
+        "real_len": indexed_dataset.IndexedDatasetBuilder(str(split_prefix) + "_real_len.bin", dtype=np.int32),
+    }
+    count = 0
+    try:
+        for record in records:
+            input_ids = _as_int_array(record, "input_ids")
+            labels = _as_int_array(record, "labels")
+            boundaries = _as_int_array(record, "cu_seqlens")
+            real_len_array = _as_int_array(record, "real_len", dtype=np.int64, allow_scalar=True)
+            if input_ids.size != sequence_length or labels.size != sequence_length:
+                raise ValueError("Tokenized SFT input_ids and labels must equal sequence_length")
+            if real_len_array.size != 1:
+                raise ValueError("Tokenized SFT real_len must contain one value")
+            real_len = int(real_len_array[0])
+            if real_len <= 0 or real_len > sequence_length:
+                raise ValueError("Tokenized SFT real_len must be within input_ids length")
+            if boundaries.size < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != real_len:
+                raise ValueError("Tokenized SFT cu_seqlens must start at 0 and end at real_len")
+            if np.any(np.diff(boundaries) <= 0) or np.any(boundaries < 0) or np.any(boundaries > real_len):
+                raise ValueError("Tokenized SFT cu_seqlens must be increasing within real_len")
+            if np.any(input_ids[real_len:] != int(pad_token_id)):
+                raise ValueError("Tokenized SFT input_ids after real_len must use pad_token_id")
+            if np.any(labels[real_len:] != int(ignore_index)):
+                raise ValueError("Tokenized SFT labels after real_len must use ignore_index")
+            if not np.any(labels[:real_len] != int(ignore_index)):
+                raise ValueError("Tokenized SFT record contains no trainable labels")
+            for field, value in (("input_ids", input_ids), ("labels", labels),
+                                 ("cu_seqlens", boundaries), ("real_len", real_len_array)):
+                builders[field].add_item(torch.as_tensor(value))
+                builders[field].end_document()
+            count += 1
+        if not count:
+            raise ValueError("Tokenized SFT input contains no records")
+        for field, builder in builders.items():
+            builder.finalize(str(split_prefix) + f"_{field}.idx")
+    except Exception:
+        for builder in builders.values():
+            builder.data_file.close()
+        raise
+    manifest = {**contract, "num_records": count, "splits": {split: {"num_records": count}}}
+    if previous is not None:
+        splits = previous.get("splits", {})
+        splits.update(manifest["splits"])
+        manifest["splits"] = splits
+        manifest["num_records"] = sum(int(item["num_records"]) for item in splits.values())
+    manifest_file.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    logger.info("Wrote %d tokenized SFT records to %s", count, split_prefix)
+    return manifest
+
+
+def read_hf_tokenized_dataset(path: str | Path, *, split: str = "train") -> Iterable[Mapping[str, Any]]:
+    """Read a Hugging Face ``save_to_disk`` Dataset with the common SFT schema."""
+    try:
+        from datasets import load_from_disk
+    except ImportError as exc:
+        raise RuntimeError("Reading HF SFT datasets requires the 'datasets' package") from exc
+    dataset = load_from_disk(str(Path(path).expanduser()))
+    if not hasattr(dataset, "column_names"):
+        if split not in dataset:
+            raise ValueError(f"HF SFT DatasetDict does not contain split {split!r}")
+        dataset = dataset[split]
+    required = {"input_ids", "labels", "cu_seqlens", "real_len"}
+    missing = sorted(required.difference(dataset.column_names))
+    if missing:
+        raise ValueError(f"HF SFT dataset is missing columns: {missing}")
+    return (dataset[index] for index in range(len(dataset)))
+
+
 def read_jsonl(path: str | Path) -> Iterable[Mapping[str, Any]]:
     """Yield JSON objects from an UTF-8 JSONL file."""
     with Path(path).expanduser().open("r", encoding="utf-8") as input_file:
@@ -460,10 +592,12 @@ def read_jsonl(path: str | Path) -> Iterable[Mapping[str, Any]]:
 
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare pure-text SFT indexed data")
-    parser.add_argument("--input", required=True, help="Input JSONL file")
+    parser.add_argument("--input", required=True, help="Input JSONL file or HF save_to_disk directory")
+    parser.add_argument("--input-format", choices=("jsonl", "hf_tokenized"), default="jsonl")
     parser.add_argument("--output-prefix", required=True)
-    parser.add_argument("--tokenizer", required=True)
+    parser.add_argument("--tokenizer", required=False)
     parser.add_argument("--sequence-length", type=int, required=True)
+    parser.add_argument("--pad-token-id", type=int, default=0)
     parser.add_argument("--split", default="train")
     parser.add_argument("--source-format", default="auto")
     parser.add_argument("--loss-mode", default="assistant_only", choices=("assistant_only", "completion_only"))
@@ -478,21 +612,23 @@ def _build_cli() -> argparse.ArgumentParser:
 def main() -> None:
     """Run the pure-text SFT preparation CLI."""
     args = _build_cli().parse_args()
+    if args.input_format == "hf_tokenized":
+        write_tokenized_sft_dataset(
+            read_hf_tokenized_dataset(args.input, split=args.split),
+            output_prefix=args.output_prefix,
+            sequence_length=args.sequence_length,
+            pad_token_id=args.pad_token_id,
+        )
+        return
+    if not args.tokenizer:
+        raise ValueError("--tokenizer is required for JSONL input")
     from transformers import AutoTokenizer
-
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=args.trust_remote_code)
     write_sft_dataset(
-        read_jsonl(args.input),
-        output_prefix=args.output_prefix,
-        tokenizer=tokenizer,
-        sequence_length=args.sequence_length,
-        split=args.split,
-        source_format=args.source_format,
-        loss_mode=args.loss_mode,
-        chat_template=args.chat_template,
-        user_template=args.user_template,
-        packing=not args.no_packing,
-        append_eos=not args.no_eos,
+        read_jsonl(args.input), output_prefix=args.output_prefix, tokenizer=tokenizer,
+        sequence_length=args.sequence_length, split=args.split, source_format=args.source_format,
+        loss_mode=args.loss_mode, chat_template=args.chat_template, user_template=args.user_template,
+        packing=not args.no_packing, append_eos=not args.no_eos,
     )
 
 

@@ -263,6 +263,21 @@ SFT 的 `labels` 按 HF 约定与 `input_ids` 等长且未 shift，因此同一�
 `labels_are_shifted: false`；否则 Indexed batch 会把 labels 当作已右移的 `shift_labels` 传给 loss。
 读取器按 Indexed batch 的既有契约返回 `tokens`、`labels` 和 `loss_mask`。
 
+对于已经由 Hugging Face Dataset 预处理好的 SFT 数据（常见字段为 `input_ids`、`labels`、`cu_seqlens`
+和 `real_len`），可以直接导入，不会再次 tokenize 或猜测 loss 边界：
+
+```bash
+python -m hyper_parallel.data.tools.offline_sft \
+  --input /data/sft_data_256k_demo \
+  --input-format hf_tokenized \
+  --output-prefix /data/sft \
+  --sequence-length 32768
+```
+
+该入口要求每条记录的 `input_ids` 和 `labels` 已经是固定长度，padding 分别使用 `pad_token_id` 和
+`-100`，`cu_seqlens` 从 0 开始并以 `real_len` 结束。导入后会额外保存
+`<split>_cu_seqlens` 和 `<split>_real_len`，读取样本时返回 `cu_seqlens`、`real_len` 字段。
+
 Indexed 路径使用共同前缀的两个文件：
 
 ```text

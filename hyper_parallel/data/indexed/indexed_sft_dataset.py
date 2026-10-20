@@ -86,6 +86,15 @@ class SFTIndexedDataset(Dataset):
         self.ignore_index = int(manifest["ignore_index"])
         self.sequence_length = int(manifest["sequence_length"])
         self.packing = bool(manifest["packing"])
+        self.boundaries_reader = None
+        self.real_len_reader = None
+        if manifest.get("boundaries", False):
+            boundaries_prefix = str(split_prefix) + "_cu_seqlens"
+            real_len_prefix = str(split_prefix) + "_real_len"
+            self.boundaries_reader = IndexedDataReader(boundaries_prefix, mmap=mmap)
+            self.real_len_reader = IndexedDataReader(real_len_prefix, mmap=mmap)
+            if len(self.boundaries_reader) != len(self.input_reader) or len(self.real_len_reader) != len(self.input_reader):
+                raise ValueError("SFT boundary metadata contains a different record count")
         self.num_samples = len(self.input_reader) if num_samples is None else int(num_samples)
         if self.num_samples < 0 or self.num_samples > len(self.input_reader):
             raise ValueError(
@@ -111,7 +120,7 @@ class SFTIndexedDataset(Dataset):
             raise ValueError(f"Unsupported SFT manifest format: {manifest['format']!r}")
         if manifest["labels_are_shifted"]:
             raise ValueError("SFT Indexed Dataset requires unshifted labels")
-        if manifest["loss_mode"] not in {"assistant_only", "completion_only"}:
+        if manifest["loss_mode"] not in {"assistant_only", "completion_only", "precomputed"}:
             raise ValueError(f"Unsupported SFT loss_mode: {manifest['loss_mode']!r}")
         if int(manifest["sequence_length"]) <= 0:
             raise ValueError("SFT manifest sequence_length must be positive")
@@ -134,11 +143,17 @@ class SFTIndexedDataset(Dataset):
         labels = np.asarray(self.label_reader[index]).copy()
         input_tensor = torch.from_numpy(input_ids).to(dtype=torch.long)
         label_tensor = torch.from_numpy(labels).to(dtype=torch.long)
-        return {
+        sample = {
             "tokens": input_tensor,
             "labels": label_tensor,
             "loss_mask": label_tensor.ne(self.ignore_index).to(dtype=torch.long),
         }
+        if self.boundaries_reader is not None:
+            boundaries = np.asarray(self.boundaries_reader[index]).copy()
+            real_len = np.asarray(self.real_len_reader[index]).copy()
+            sample["cu_seqlens"] = torch.from_numpy(boundaries).to(dtype=torch.int32)
+            sample["real_len"] = torch.from_numpy(real_len).to(dtype=torch.int32).squeeze(0)
+        return sample
 
 
 def build_sft_dataset_splits(

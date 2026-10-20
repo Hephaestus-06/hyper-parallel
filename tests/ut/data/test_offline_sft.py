@@ -27,6 +27,7 @@ from hyper_parallel.data.tools.offline_sft import (
     normalize_sft_record,
     pack_sft_samples,
     write_sft_dataset,
+    write_tokenized_sft_dataset,
 )
 
 
@@ -233,6 +234,42 @@ class TestOfflineSFT(unittest.TestCase):
                     sequence_length=8,
                     split="valid",
                     append_eos=False,
+                )
+
+    def test_pre_tokenized_hf_record_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = str(Path(directory) / "sft")
+            manifest = write_tokenized_sft_dataset(
+                [{
+                    "input_ids": [11, 12, 13, 0, 0, 0],
+                    "labels": [-100, 12, 13, -100, -100, -100],
+                    "cu_seqlens": [0, 3],
+                    "real_len": 3,
+                }],
+                output_prefix=prefix,
+                sequence_length=6,
+                pad_token_id=0,
+            )
+            self.assertEqual(manifest["source_format"], "tokenized")
+            dataset = SFTIndexedDataset(prefix)
+            sample = dataset[0]
+            self.assertEqual(sample["tokens"].tolist(), [11, 12, 13, 0, 0, 0])
+            self.assertEqual(sample["cu_seqlens"].tolist(), [0, 3])
+            self.assertEqual(sample["real_len"].item(), 3)
+
+    def test_pre_tokenized_hf_record_rejects_bad_padding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "pad_token_id"):
+                write_tokenized_sft_dataset(
+                    [{
+                        "input_ids": [11, 12, 13, 99],
+                        "labels": [-100, 12, 13, -100],
+                        "cu_seqlens": [0, 3],
+                        "real_len": 3,
+                    }],
+                    output_prefix=str(Path(directory) / "sft"),
+                    sequence_length=4,
+                    pad_token_id=0,
                 )
 
 
