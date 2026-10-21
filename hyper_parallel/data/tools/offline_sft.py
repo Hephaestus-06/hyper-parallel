@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
@@ -34,6 +33,7 @@ from hyper_parallel.data.constants import IGNORE_INDEX
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 from hyper_parallel.data.text.chat_template import build_chat_template
 from hyper_parallel.data.tools import io as indexed_dataset
+from hyper_parallel.data.text.sft.schema import CanonicalSFTRecord, SFTMessage
 
 logger = get_dataset_logger(__name__)
 
@@ -50,24 +50,6 @@ _ROLE_ALIASES = {
     "function": "tool",
     "observation": "tool",
 }
-
-
-@dataclass(frozen=True)
-class SFTMessage:
-    """One normalized conversation message and its loss participation."""
-
-    role: str
-    content: str
-    trainable: bool = False
-
-
-@dataclass(frozen=True)
-class CanonicalSFTRecord:
-    """Normalized SFT sample shared by all source-format adapters."""
-
-    messages: tuple[SFTMessage, ...]
-    source_format: str
-    direct_segments: tuple[str, str] | None = None
 
 
 def _require_mapping(record: Mapping[str, Any] | Any) -> Mapping[str, Any]:
@@ -216,6 +198,7 @@ def encode_sft_record(
         loss_mode: str = "assistant_only",
         chat_template: str | None = None,
         append_eos: bool = True,
+        truncate: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Tokenize one canonical record and return unshifted ids and labels."""
     if max_seq_len <= 0:
@@ -244,13 +227,15 @@ def encode_sft_record(
             if template_name in {"default", "tokenizer", "gpt_oss", "llama2"}
             else {}
         )
-        encoded = template.encode_messages(messages, max_seq_len=max_seq_len, **template_kwargs)
+        template_limit = max_seq_len if truncate else 2 ** 31 - 1
+        encoded = template.encode_messages(messages, max_seq_len=template_limit, **template_kwargs)
         input_ids = list(encoded["input_ids"])
         labels = list(encoded["labels"])
     if not input_ids:
         raise ValueError("SFT record produced no tokens")
-    input_ids = input_ids[-max_seq_len:]
-    labels = labels[-max_seq_len:]
+    if truncate:
+        input_ids = input_ids[-max_seq_len:]
+        labels = labels[-max_seq_len:]
     if len(input_ids) != len(labels):
         raise ValueError("Tokenizer produced input_ids and labels with different lengths")
     if not any(label != IGNORE_INDEX for label in labels):

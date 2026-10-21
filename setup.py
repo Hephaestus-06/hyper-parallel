@@ -106,6 +106,7 @@ def get_extra_requires() -> dict[str, list[str]]:
         dict, optional dependency groups keyed by extra name.
     """
     return {
+        "sft": ["datasets>=2.18", "transformers>=4.40", "pyarrow>=15"],
         "torch": list(TORCH29_REQUIRES),
         "torch26": list(TORCH26_REQUIRES),
         "torch27": list(TORCH27_REQUIRES),
