@@ -52,6 +52,7 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     ("path", "value", "error"),
     [
         (("train", "max_steps"), 0, "max_steps must be positive"),
+        (("train", "optimizer", "fp32_main_params"), "true", "must be a boolean"),
         (("train", "micro_batch_size"), 0, "micro_batch_size must be positive"),
         (("train", "response_mini_batch_size"), 3, "cannot exceed the local rollout"),
         (("train", "policy_update_epochs"), 0, "policy_update_epochs must be positive"),
@@ -85,6 +86,25 @@ def test_config_rejects_invalid_runtime_contracts(
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
+def test_fp32_main_parameter_policy_reaches_runtime_and_rejects_low_precision_reduction(validated_recipe) -> None:
+    """The role optimizer and shared FSDP must receive one consistent main-gradient policy."""
+    validated_recipe["train"]["optimizer"]["fp32_main_params"] = True
+    validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+    assert build_runtime_config(validated_recipe).optimizer.fp32_main_params
+    validated_recipe["train"]["mixed_precision"]["reduce_dtype"] = "bfloat16"
+    with pytest.raises(ValueError, match="float32 gradient reduction"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
+def test_actor_critic_precision_policy_cannot_differ(validated_recipe) -> None:
+    """Both models share the FSDP main-gradient policy and must own compatible optimizers."""
+    validated_recipe["algorithm"]["name"] = "ppo"
+    validated_recipe["train"]["optimizer"]["fp32_main_params"] = True
+    validated_recipe["train"]["critic"] = {"optimizer": {"fp32_main_params": False}}
+    with pytest.raises(ValueError, match="same fp32_main_params"):
+        validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
+
+
 def test_all_st_recipes_pass_production_validation(
     validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -96,9 +116,51 @@ def test_all_st_recipes_pass_production_validation(
         for phase in range(1, 3 if case.resume else 2):
             config = runtime.prepare_config(case, phase, (8100, 8200), devices)
             config["model"].update(validated_recipe["model"])
+            if "reward_model" in config:
+                config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
             for field in ("train_path", "test_path"):
                 config["data"][field] = validated_recipe["data"][field]
             validate_config(resolve_vllm_automatic_limits(config), build_algorithm(config["algorithm"]))
+
+
+def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validated_recipe: dict) -> None:
+    """The optional thread setting preserves None and a positive integer without coercion."""
+    algorithm = build_algorithm(validated_recipe["algorithm"])
+    for threads in (None, 8):
+        validated_recipe["train"]["model_init_cpu_threads"] = threads
+        validate_config(validated_recipe, algorithm)
+        actual = validated_recipe["train"]["model_init_cpu_threads"]
+        assert actual == threads, f"Expected unchanged thread setting {threads!r}, got {actual!r}"
+    validated_recipe["train"]["model_init_cpu_threads"] = True
+    with pytest.raises(ValueError, match="model_init_cpu_threads.*positive integer"):
+        validate_config(validated_recipe, algorithm)
+
+
+def test_colocated_reward_model_config_rejects_conflicts(
+    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check RM ownership, scoring callback and service ports before startup."""
+    runtime = importlib.import_module("tests.common.rl_st_cases")
+    case = next(case for case in runtime.CASES if case.name == "reward-model-tp1")
+    devices = list(range(case.cards))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, devices)))
+    config = runtime.prepare_config(case, 1, (8100, 8200), devices)
+    config["model"].update(validated_recipe["model"])
+    config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
+    for field in ("train_path", "test_path"):
+        config["data"][field] = validated_recipe["data"][field]
+    config = resolve_vllm_automatic_limits(config)
+    validate_config(config, build_algorithm(config["algorithm"]))
+    for field, value, error in (
+        ("port", 8100, "distinct"),
+        ("scorer", "examples.gsm8k.agent:compute_gsm8k_reward", "async"),
+        ("tensor_parallel_size", 3, "TP1/TP2"),
+    ):
+        old = config["reward_model"][field]
+        config["reward_model"][field] = value
+        with pytest.raises(ValueError, match=error):
+            validate_config(config, build_algorithm(config["algorithm"]))
+        config["reward_model"][field] = old
 
 
 def _complete_config(tmp_path: Path) -> dict:
@@ -236,7 +298,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
 
 @pytest.mark.parametrize(
     ("model_type", "architecture"),
-    [("qwen3_moe", "Qwen3MoeForCausalLM"), ("deepseek_v3", "DeepseekV3ForCausalLM")],
+    [("deepseek_v3", "DeepseekV3ForCausalLM")],
 )
 def test_removed_model_families_fail_before_runtime_construction(
     tmp_path: Path, model_type: str, architecture: str,

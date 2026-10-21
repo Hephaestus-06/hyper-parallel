@@ -42,7 +42,7 @@ import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 
 _ULYSSES_WRAPPED_FLAG = "_hyper_ulysses_wrapped"
@@ -467,7 +467,7 @@ def _ulysses_all_to_all(
         + list(range(scatter_dim + 1, split_ndim))
     )
     send = tensor.contiguous().reshape(split_shape).permute(permutation).contiguous()
-    received = _collectives.differentiable_all_to_all(
+    received = communication.differentiable_all_to_all(
         send, list(send.shape), cp_mesh.get_group())
     return _reconstruct_all_to_all(received, gather_dim)
 
@@ -520,6 +520,30 @@ def ulysses_head_to_seq(
         gather_dim=head_dim,
         cp_mesh=cp_mesh,
     )
+
+
+def _validate_ulysses_head_counts(
+        query: Tensor, key: Tensor, value: Tensor,
+        ulysses_degree: int, context: str) -> None:
+    """Require every Q/K/V head dimension to be shardable by Ulysses."""
+    head_counts = {
+        "query": query.shape[1],
+        "key": key.shape[1],
+        "value": value.shape[1],
+    }
+    invalid = {
+        name: count
+        for name, count in head_counts.items()
+        if count % ulysses_degree
+    }
+    if invalid:
+        details = ", ".join(
+            f"{name}_heads={count}" for name, count in invalid.items()
+        )
+        raise ValueError(
+            f"{context} requires every Q/K/V head count to be divisible by "
+            f"ulysses_degree ({ulysses_degree}), got {details}"
+        )
 
 
 class _AllGatherAlongDim(torch.autograd.Function):
@@ -653,6 +677,9 @@ def hybrid_cp_attention(
     ``attention_kwargs`` are forwarded unchanged. Mask construction and other
     model-input semantics belong to the caller's input-preparation contract.
     """
+    _validate_ulysses_head_counts(
+        query, key, value, ulysses_degree, "Hybrid CP"
+    )
     ulysses_mesh, colossal_mesh = (
         _build_hybrid_cp_submeshes(cp_mesh, ulysses_degree)
     )

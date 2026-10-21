@@ -77,12 +77,20 @@ def sync_and_update_expert_bias(
     Note:
         Reference implementation: Megatron-LM megatron/core/transformer/moe/moe_utils.py
         uses TP×CP×DP group synchronization for global batch statistics.
+        Model adapters may provide ``expert_bias_update_groups`` and
+        ``expert_bias_update_rate`` to override generic groups and update speed.
     """
-    for group in (tp_group, cp_group, dp_group):
+    groups = getattr(moe, "expert_bias_update_groups", None)
+    if groups is None:
+        groups = (tp_group, cp_group, dp_group)
+    for group in groups:
         if group is not None:
             dist.all_reduce(moe.tokens_per_expert, group=getattr(group, "group", group))
 
-    moe.update_expert_bias(lr=lr, num_recomputations=num_recomputations)
+    moe.update_expert_bias(
+        lr=getattr(moe, "expert_bias_update_rate", lr),
+        num_recomputations=num_recomputations,
+    )
 
 
 def _get_moe_layers(model: "nn.Module") -> list:
@@ -207,7 +215,8 @@ class MoEMonitorCallback:
 
         On PyTorch 2.0+, uses ``optimizer.register_step_post_hook``.
         The hook fires after each ``optimizer.step()`` call, so that
-        expert bias is updated once parameters have been updated.
+        expert bias is updated once parameters have been updated. Repeated
+        calls replace the existing hook registration.
 
         Args:
             optimizer: The optimizer instance to register the hook on.
@@ -220,6 +229,7 @@ class MoEMonitorCallback:
                 "Optimizer does not support register_step_post_hook. "
                 "Requires PyTorch 2.0+. Call on_step_end() manually instead."
             )
+        self.remove()
         self._hook_handle = optimizer.register_step_post_hook(
             lambda *_: self.on_step_end(),
         )

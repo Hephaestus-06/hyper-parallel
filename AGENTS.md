@@ -4,7 +4,7 @@
 
 HyperParallel is an **easy-to-use, high-performance distributed parallel acceleration library** for distributed model training, inference and reinforcement learning. It provides unified abstractions for DP, FSDP/HSDP, TP, EP, CP, PP, activation checkpoint/swap, and parameter/optimizer offload. Hybrid strategies combine freely.
 
-Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyTorch and MindSpore**.
+Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyTorch**.
 
 ---
 
@@ -40,7 +40,7 @@ python3 .agent/skills/autogit/scripts/autogit.py pr
 python3 .agent/scripts/check_agents_catalog.py
 ```
 
-Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.distributed_launcher`, or `parallel_case` (see `.agent/rules/testing.md`).
+Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher`, or `parallel_case` (see `.agent/rules/testing.md`).
 
 ---
 
@@ -92,7 +92,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 - **Runner:** pytest + `@arg_mark` (`tests/common/mark_utils.py`)
 - **Authoring:** prefer `unittest.TestCase` where existing UT does (pytest still runs them)
 - UT: `tests/ut/` — no distributed setup
-- ST: `torchrun_case` / `msrun_case` / `parallel_case` (multi-card) — **launchers must not import** `torch` / `mindspore` / `hyper_parallel` (see testing.md § ST launcher import rule)
+- ST: `torchrun_case` / `parallel_case` (multi-card) — **launchers must not import** `torch` / `hyper_parallel` (see testing.md § ST launcher import rule)
 
 ---
 
@@ -146,6 +146,8 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
+| **hf-model-integration** | Integrate HF-native or HF-component custom models through model-owned adapters | model onboarding / functional bring-up |
+| **hf-model-precision-validation** | Validate module parity and distributed numerical self-consistency | model numerical acceptance / diagnosis |
 
 ### Commands
 
@@ -185,4 +187,5 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
 | **hyper-rl** | `hyper_parallel/rl/**`, RL docs and agent rules — sole RL entry; also consult it for migrated RL tests |
+| **nd-cost-model** | `hyper_parallel/auto_parallel/**`, `tests/ut/auto_parallel/**`: golden before and after, measured figures (B12) |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

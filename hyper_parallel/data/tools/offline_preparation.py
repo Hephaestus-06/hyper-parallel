@@ -20,6 +20,7 @@ import argparse
 import glob
 import gzip
 import json
+import logging
 import math
 import multiprocessing
 import os
@@ -50,6 +51,8 @@ from hyper_parallel.data.tools.offline_record_transform import (
 from hyper_parallel.data.dataset_logging import get_dataset_logger
 
 logger = get_dataset_logger(__name__)
+
+logger = logging.getLogger(__name__)
 
 
 class CustomLanguageVars(PunktLanguageVars):
@@ -864,7 +867,7 @@ def prepare_offline_dataset(args: argparse.Namespace) -> None:
 
     performance = {}
     for workers in worker_candidates:
-        logger.info("Processing data with %d workers.", workers)
+        logger.info("Processing data with %s workers", workers)
         workers_per_partition = workers // args.partitions
 
         if args.split_sentences:

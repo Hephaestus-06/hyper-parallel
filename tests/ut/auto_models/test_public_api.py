@@ -73,6 +73,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_tp_local_attr_plan", "None"),
                 ("_deferred_bias_params", "()"),
                 ("is_boundary", "True"),
+                ("skip_source_lowering", "None"),
                 ("region_dispatch", "None"),
                 ("inner_target", "None"),
                 ("inner_wrapper", "None"),
@@ -170,25 +171,35 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("pp_size", "1"),
                 ("sequence_parallel", "False"),
                 ("loss_parallel", "False"),
+                (
+                    "encoder_parallel",
+                    "<factory> EncoderParallelConfig(enabled=False, encoder_cp_size=1)",
+                ),
             ],
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_compile_config_fields(self):
-        """CompileConfig field order and defaults stay unchanged."""
+        """
+        Feature: Dynamic joint-graph training.
+        Description: CompileConfig field order and defaults stay unchanged.
+        Expectation: Losses, gradients and public contracts remain correct.
+        """
         from hyper_parallel.trainer.config import CompileConfig
 
         self.assertEqual(
             _field_snapshot(CompileConfig),
             [
                 ("enabled", "False"),
+                ("use_joint_graph", "False"),
                 ("mode", "'default'"),
                 ("fullgraph", "False"),
                 ("dynamic", "False"),
                 ("backend", "None"),
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
+                ("dynamic_arg_dims", "None"),
             ],
         )
 
@@ -206,6 +217,8 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("enabled", "False"),
                 ("format", "'mxfp8_e4m3'"),
                 ("scaling", "'mx_block'"),
+                ("dtype_schemes", "<factory> {}"),
+                ("default_dtype_scheme", "None"),
             ],
         )
 
@@ -220,13 +233,16 @@ class TestTrainerConfigContracts(unittest.TestCase):
             [
                 "AcceleratorConfig",
                 "ActivationCheckpointConfig",
+                "ActivationCheckpointSelection",
                 "CompileConfig",
                 "DataLoaderConfig",
                 "DatasetConfig",
                 "DebugConfig",
                 "FSDP2Config",
                 "MixedPrecisionConfig",
+                "ModelIntegrationConfig",
                 "OptimizerConfig",
+                "OptimizerSwapConfig",
                 "ProfilingConfig",
                 "Target",
                 "TrainerConfig",
@@ -245,19 +261,21 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
         """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        from hyper_parallel.components import optim
 
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.Muon.__init__)),
             "(self, muon_config: dict, adamw_config: dict, "
             "model: torch.nn.modules.module.Module, "
             "extra_adamw_name_keywords: Optional[List[str]] = None, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.MixedPrecisionOptimizer.__init__)),
@@ -279,7 +297,7 @@ class TestOptimizerContracts(unittest.TestCase):
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
         """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        import hyper_parallel.components.optim as optim
+        from hyper_parallel.components import optim
         from hyper_parallel.components.optim import mixed_precision_optimizer
 
         self.assertEqual(

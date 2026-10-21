@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
-from rl.roles.weight_sync.model_adapter import (
+from rl.weight_sync.model_adapter import (
     ModelWeightAdapter,
     build_model_weight_adapter,
 )
@@ -33,7 +33,7 @@ def _model(family: str, *, tied: bool = True):
     architecture, model_type = identities[family]
     registration = ModelRegistration(
         name=family,
-        hyper_model_name=family,
+        builder_model_name=family,
         weights_path="/model",
         tokenizer_path="/tokenizer",
         hf_architecture=architecture,

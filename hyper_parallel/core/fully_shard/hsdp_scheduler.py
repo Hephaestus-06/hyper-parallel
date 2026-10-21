@@ -33,7 +33,6 @@ from hyper_parallel.core.fully_shard.utils import (
     SourceShardMetaInfo,
     apply_to_tensors,
     cast_fp_tensor,
-    get_cells_and_names,
     parameters_dict,
     profiler_record,
 )
@@ -66,7 +65,6 @@ class ParamGroupCommCtx:
     def __init__(self) -> None:
         self.pre_param_group = None
         self.all_reduce_param_group = None
-        # MindSpore keeps the reduce-scatter handle outside the parameter group.
         self.comm_handle = None
 
 
@@ -258,7 +256,7 @@ class HSDPSchedulerV2:
             tree_ctx = self.scheduler_ctx
             tree_ctx.root_module = self.cell
             registered_schedulers = set()
-            for module_name, module in get_cells_and_names(tree_ctx.root_module):
+            for module_name, module in tree_ctx.root_module.named_modules():
                 from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
                 if isinstance(module, HSDPModule):
                     submod_scheduler = module.hsdp_scheduler
@@ -452,13 +450,12 @@ class HSDPSchedulerV2:
         self._backup_forward_fetch = self.forward_prefetch_cells
         self.forward_prefetch_cells = []
 
-    def _restore_forward_prefetch_after_recompute(self) -> bool:
-        """Restore forward prefetch list after a recompute forward hook finishes."""
+    def _restore_forward_prefetch_after_recompute(self) -> None:
+        """Restore the saved forward prefetch list after activation recompute."""
         if self._backup_forward_fetch is None:
-            return False
+            return
         self.forward_prefetch_cells = self._backup_forward_fetch
         self._backup_forward_fetch = None
-        return True
 
     def _register_post_backward_hook(self, args, kwargs):
         """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
@@ -490,7 +487,7 @@ class HSDPSchedulerV2:
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 
-    def _register_backward_pre_hook(self, outputs):
+    def _register_backward_pre_hook(self, outputs) -> None:
         """Register gradient hooks on all requires-grad outputs to trigger backward pre hook."""
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
@@ -507,7 +504,6 @@ class HSDPSchedulerV2:
                 # pylint: enable=C0103, W0102
                 handle = output.register_hook(wrapper_for_backward_pre_hook)
                 handle_ref[0] = handle
-        return outputs
 
     @_dynamo_disable
     def _forward_hook(self, cell, inputs, outputs):  # pylint: disable=R1710
@@ -536,6 +532,7 @@ class HSDPSchedulerV2:
     def _root_backward_hook(self):
         """Drain all DP pipelines, then run final TP reduction and apply gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
+        self.check_state_prefetch_handles_consumed()
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
@@ -548,6 +545,35 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+
+    def check_state_prefetch_handles_consumed(self) -> None:
+        """Check that all parameters in the module tree consumed their prefetch work.
+
+        Raises:
+            RuntimeError: If a parameter or fused bucket retains an all-gather
+                handle because the configured prefetch order is incorrect.
+        """
+        unconsumed_param_fqns = []
+        for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            hsdp_state = hsdp_scheduler.hsdp_state
+            if hsdp_state is None:
+                continue
+            unconsumed_param_fqns.extend(
+                str(param) for param in hsdp_state.hsdp_params
+                if param.allgather_comm_ctx.allgather_handle is not None
+            )
+            if hsdp_state.param_group is not None:
+                for bucket in hsdp_state.param_group.all_gather_buckets:
+                    result = bucket.all_gather_result
+                    if result is not None and result.handle is not None:
+                        unconsumed_param_fqns.extend(str(param) for param in bucket.hsdp_params)
+        if unconsumed_param_fqns:
+            param_fqns = ", ".join(dict.fromkeys(unconsumed_param_fqns))
+            raise RuntimeError(
+                f"Unconsumed prefetch handles for parameters: {param_fqns}. "
+                "The prefetch order is incorrect. Set forward/backward prefetch order "
+                "according to the model's actual execution order."
+            )
 
     def _finalize_comm_fusion_reductions(self) -> None:
         """Drain the comm_fusion=True RS/AR pipeline."""
@@ -607,7 +633,8 @@ class HSDPSchedulerV2:
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
-    def _register_forward_module_hook(self, mod, hook) -> None:
+    @staticmethod
+    def _register_forward_module_hook(mod, hook) -> None:
         """Register forward hook; use ``always_call=True`` when supported (matches PyTorch FSDP)."""
         sig = inspect.signature(mod.register_forward_hook)
         if "always_call" in sig.parameters:

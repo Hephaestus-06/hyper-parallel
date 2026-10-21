@@ -18,6 +18,7 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../../../../.." && pwd)
+default_image=swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.23.0.post1-code-agent-arm64
 workspace_root=$(cd -- "${repo_root}/.." && pwd)
 
 deployment=${1:-colocated}
@@ -25,8 +26,11 @@ deployment=${1:-colocated}
     printf 'Usage: %s [colocated|disjoint]\n' "$0" >&2
     exit 1
 }
+if (( $# > 0 )); then
+    shift
+fi
 
-image=${HYPER_QWEN3_IMAGE:-swr.cn-east-3.myhuaweicloud.com/huawei-hyper-rl/hyper-rl:v0.22.1rc1-unified-arm64}
+image=${HYPER_QWEN3_IMAGE:-${default_image}}
 model_root=${HYPER_QWEN3_MODEL_ROOT:-${workspace_root}/models/Qwen3-4B}
 data_root=${HYPER_QWEN3_DATA_ROOT:-${workspace_root}/data/gsm8k}
 result_root=${HYPER_QWEN3_RESULT_ROOT:-${repo_root}/hyper_parallel/rl/output/qwen3-consistency-smoke}
@@ -251,9 +255,6 @@ max_train_samples=${HYPER_QWEN3_MAX_TRAIN_SAMPLES:-${global_prompt_count}}
 }
 response_mini_batch_size=$((prompt_batch_size * num_return_sequences))
 config_name=qwen3_4b_gsm8k_vllm_production.yaml
-if (( tensor_parallel_size == 2 )); then
-    config_name=qwen3_4b_gsm8k_vllm_tp2_consistency.yaml
-fi
 printf '%s\n' \
     "image=${image}" \
     "deployment=${deployment}" \
@@ -308,6 +309,8 @@ mkdir -p "${result_root}"
 
 docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -e "ASCEND_RT_VISIBLE_DEVICES=${visible_devices}" \
+    -e "HYPER_RESULT_UID=$(id -u)" \
+    -e "HYPER_RESULT_GID=$(id -g)" \
     -e HYPER_PARALLEL_PLATFORM=torch \
     -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 \
@@ -350,6 +353,7 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
     -w /workspace/hyper-parallel \
     "${image}" /bin/bash -lc '
         set -euo pipefail
+        trap "chown -R ${HYPER_RESULT_UID}:${HYPER_RESULT_GID} /results" EXIT
         unset VLLM_PLUGINS
         export PYTHONPATH=/workspace/hyper-parallel/hyper_parallel/rl:/workspace/hyper-parallel:${PYTHONPATH:-}
         bash /workspace/hyper-parallel/hyper_parallel/rl/docker/install_runtime.sh
@@ -365,7 +369,31 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
         fi
 
         set +e
-        rollout_args=(
+        rollout_args=()
+        if [[ "${HYPER_QWEN3_TENSOR_PARALLEL_SIZE}" == "2" ]]; then
+            rollout_args+=(
+                --data.max_prompt_length=256
+                --rollout.seed=20260825
+                --rollout.vllm.max_model_len=512
+                --rollout.vllm.max_num_batched_tokens=512
+                --rollout.vllm.max_num_seqs=4
+                --rollout.vllm.startup_timeout=1200
+                --rollout.vllm.request_timeout=1200
+                --rollout.vllm.enable_prompt_tokens_details=true
+                --rollout.vllm.server_hccl_if_base_port=64400
+                --rollout.vllm.server_hccl_npu_socket_port_range=64400-64500
+                --train.micro_batch_size=1
+                --train.checkpoint.output_dir=/results/checkpoints
+                --evaluation.batch_size=2
+                --evaluation.max_samples=2
+                --evaluation.max_new_tokens=32
+                --evaluation.log_samples=0
+                --evaluation.progress_steps=0
+                --logging.experiment_name=qwen3_4b_gsm8k_vllm_tp2_consistency
+                --logging.wandb.directory=/results/wandb
+            )
+        fi
+        rollout_args+=(
             --consistency.enabled=true
             --rollout.vllm.deployment="${HYPER_QWEN3_DEPLOYMENT}"
             --rollout.vllm.data_parallel_size="${HYPER_QWEN3_ROLLOUT_DATA_PARALLEL_SIZE}"
@@ -409,9 +437,9 @@ docker run --rm --privileged --shm-size="${shm_size}" --network=host \
                 --train.max_steps="${HYPER_QWEN3_MAX_STEPS}" \
                 --train.optimizer.lr="${HYPER_QWEN3_LEARNING_RATE}" \
                 --train.learning_gate.enabled="${HYPER_QWEN3_LEARNING_GATE_ENABLED}" \
-                "${rollout_args[@]}"
+                "${rollout_args[@]}" "$@"
         } 2>&1 | tee "/results/${HYPER_QWEN3_LOG_NAME}"
         status="${PIPESTATUS[0]}"
         set -e
         exit "${status}"
-    '
+    ' hyper-rl-trainer "$@"

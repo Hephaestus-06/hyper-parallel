@@ -24,6 +24,20 @@ import torch
 
 import rl.evaluation as evaluation_module
 from rl.evaluation import Evaluator
+from rl.dataset.episodes import generation_finish_reason
+
+
+def test_finish_reason_uses_last_model_action_and_preserves_unknown() -> None:
+    """An environment completion must not hide a truncated last generation or invent a stop."""
+    trajectory = SimpleNamespace(metadata={"finish_reason": "stop"}, turns=(
+        SimpleNamespace(role="assistant", trainable=True, metadata={"finish_reason": "stop"}),
+        SimpleNamespace(role="assistant", trainable=True, metadata={"finish_reason": "length"}),
+        SimpleNamespace(role="environment", trainable=False, metadata={"finish_reason": "stop"}),
+    ))
+    assert generation_finish_reason(trajectory) == "length"
+    trajectory.turns[1].metadata.clear()
+    assert generation_finish_reason(trajectory) is None
+    assert generation_finish_reason(SimpleNamespace(metadata={"finish_reason": "stop"})) == "stop"
 
 
 def test_evaluator_excludes_padding_and_aggregates_rank_zero_results(
@@ -64,14 +78,15 @@ def test_evaluator_excludes_padding_and_aggregates_rank_zero_results(
         @staticmethod
         def generate(prompt_records: Any, policy_version: int) -> Any:
             assert len(prompt_records) == 2
+            assert all(prompt.metadata["phase"] == "evaluation" for prompt in prompt_records)
             assert policy_version in (7, 8)
             return SimpleNamespace(
                 rewards=torch.tensor([1.0, 999.0]),
                 action_mask=torch.tensor([[False, True, True], [False, True, True]]),
                 responses=("correct", "padding"),
                 trajectories=(
-                    SimpleNamespace(metadata={"extracted_answer": "1"}),
-                    SimpleNamespace(metadata={"extracted_answer": "999"}),
+                    SimpleNamespace(metadata={"extracted_answer": "1"}, reward_components={"success": 1.0}),
+                    SimpleNamespace(metadata={"extracted_answer": "999"}, reward_components={"success": 0.0}),
                 ),
                 generation_seconds=2.0,
             )

@@ -16,13 +16,15 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "log/log.h"
-#include "hyper_mega_moe_tiling.h"
 #include "../op_kernel/hyper_mega_moe_tiling_key.h"
+#include "hyper_mega_moe_tiling.h"
 
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
-constexpr int64_t MAX_EXPERT_NUM_PER_RANK = 16;
+constexpr int64_t MIN_RUNTIME_CONFIG_BYTES = 64;
+constexpr int64_t MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE = int64_t{1} << 32;
+constexpr int64_t MIN_EVENT_COUNTER_BYTES = 4096;
 static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, context);
   auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
@@ -72,8 +74,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   const int64_t expertNum = *expertNumAttr;
   const int64_t hiddenSize = *hiddenSizeAttr;
   const int64_t seqSize = *seqSizeAttr;
-  if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 ||
-      expertNum / ep > MAX_EXPERT_NUM_PER_RANK || hiddenSize <= 0 || seqSize <= 0) {
+  if (rankId < 0 || ep <= 0 || expertNum <= 0 || expertNum % ep != 0 || hiddenSize <= 0 || seqSize <= 0) {
     OP_LOGE(context->GetNodeName(),
             "Invalid topology: rankId=%ld, ep=%ld, expertNum=%ld, hiddenSize=%ld, seqSize=%ld.", rankId, ep,
             expertNum, hiddenSize, seqSize);
@@ -92,7 +93,8 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context) {
   OP_CHECK_NULL_WITH_CONTEXT(context, eventShape);
   int64_t runtimeBytes = runtimeShape->GetStorageShape().GetShapeSize();
   int64_t eventBytes = eventShape->GetStorageShape().GetShapeSize();
-  if (runtimeBytes < 64 || runtimeBytes >= (1LL << 32) || eventBytes < 4096) {
+  if (runtimeBytes < MIN_RUNTIME_CONFIG_BYTES || runtimeBytes >= MAX_RUNTIME_CONFIG_BYTES_EXCLUSIVE ||
+      eventBytes < MIN_EVENT_COUNTER_BYTES) {
     OP_LOGE(context->GetNodeName(), "Invalid runtime/event byte lengths: %ld/%ld.", runtimeBytes, eventBytes);
     return ge::GRAPH_FAILED;
   }

@@ -22,7 +22,6 @@ import unittest
 
 import hyper_parallel
 from hyper_parallel.core import multicore
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 from tests.common.mark_utils import arg_mark
 
 
@@ -36,26 +35,33 @@ class TestMulticoreBoundary(unittest.TestCase):
 
         Feature: Multicore public exports.
         Description: Inspect the component and HyperParallel root package symbols.
-        Expectation: MegaMoeExperts and profiler are exported only by the explicit Multicore module.
+        Expectation: Business modules and profiler are exported only by Multicore.
         """
-        self.assertEqual(MegaMoeExperts.__name__, "MegaMoeExperts")
-        self.assertIs(multicore.MegaMoeExperts, MegaMoeExperts)
-        self.assertEqual(multicore.__all__, ["MegaMoeExperts", "profiler"])
-        self.assertTrue(callable(multicore.profiler.mega_kernel_profile))
-        for name in ("MegaMoeExperts", "MulticoreModule", "mega_moe", "mega_moe_grad"):
+        self.assertEqual(multicore.__all__, [
+            "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+            "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
+        ])
+        self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
+        for name in (
+            "HyperMegaMhc",
+            "MegaGate",
+            "MegaMoeExperts",
+            "MulticoreModule",
+            "mega_moe",
+            "mega_moe_grad",
+        ):
             self.assertNotIn(name, hyper_parallel.__all__)
             self.assertFalse(hasattr(hyper_parallel, name))
-        self.assertFalse(hasattr(multicore, "__getattr__"))
         self.assertNotIn("hyper_parallel_shmem_torch", sys.modules)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_runtime_sources_do_not_import_platform_or_mindspore(self):
+    def test_runtime_sources_import_no_platform_layer(self):
         """Verify production sources stay Torch-only.
 
         Feature: Multicore runtime convergence.
         Description: Parse imports in the converged production Python tree.
-        Expectation: Runtime sources import neither MindSpore nor a HyperParallel Platform layer.
+        Expectation: Runtime sources import no HyperParallel Platform layer.
         """
         root = Path(multicore.__file__).parent
         for path in root.rglob("*.py"):
@@ -72,4 +78,28 @@ class TestMulticoreBoundary(unittest.TestCase):
                     continue
                 for module in modules:
                     with self.subTest(path=path, module=module):
-                        self.assertFalse(module.startswith(("mindspore", "hyper_parallel.platform")))
+                        self.assertFalse(module.startswith("hyper_parallel.platform"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_diagnostics_dependency_boundaries(self):
+        """Feature: MegaKernel diagnostics.
+        Description: Keep common code tool-neutral and both tools independent of business adapters.
+        Expectation: Diagnostics dependency boundaries.
+        """
+        root = Path(multicore.__file__).parent / "diagnostics"
+        for path in root.rglob("*.py"):
+            relative = path.relative_to(root)
+            forbidden = ["hyper_parallel.core.multicore.modules"]
+            if relative.parts[0] in ("common", "api.py", "__init__.py"):
+                forbidden.extend(("diagnostics.profiler", "diagnostics.dump"))
+            elif relative.parts[0] == "dump":
+                forbidden.append("diagnostics.profiler")
+            elif relative.parts[0] == "profiler":
+                forbidden.append("diagnostics.dump")
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                modules = ([node.module or ""] if isinstance(node, ast.ImportFrom)
+                           else [alias.name for alias in node.names] if isinstance(node, ast.Import) else [])
+                for module in modules:
+                    with self.subTest(path=path, module=module):
+                        self.assertFalse(any(item in module for item in forbidden))

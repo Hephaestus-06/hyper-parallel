@@ -23,6 +23,8 @@ using namespace AscendC;
 
 namespace shmem_data_plane = hyper_parallel::multicore::shmem::data_plane;
 
+namespace hyper_parallel::multicore {
+
 template <typename T>
 __aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
   __ubuf__ T *ubAddr = (__ubuf__ T *)(32);
@@ -61,6 +63,14 @@ class PutMemSignalKernel {
   }
 
   __aicore__ inline void Process() {
+    // Empty tiles still satisfy remote dependencies without resolving data addresses.
+    if (size_ == 0) {
+      shmem_data_plane::fence();
+      shmem_data_plane::signal(signal_ + signal_offset_, signal_value_,
+                               signal_op_ == 1 ? shmem_data_plane::SignalOp::Add : shmem_data_plane::SignalOp::Set,
+                               target_pe_);
+      return;
+    }
     // Perform data transfer
     auto size_per_core = size_ / aiv_num_;
     auto target_ptr = target_ + target_offset_ + aiv_idx_ * size_per_core;
@@ -148,11 +158,13 @@ class PutMemSignalKernel {
   uint32_t aiv_num_ = 0;
 };
 
+}  // namespace hyper_parallel::multicore
+
 extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t target_offset, GM_ADDR src,
                                                         int64_t src_offset, int64_t size, GM_ADDR signal,
                                                         int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
                                                         int64_t signal_op, int64_t target_pe, bool non_blocking) {
-  PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
+  hyper_parallel::multicore::PutMemSignalKernel<DTYPE_DISPATCH_TARGET> op;
   op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
           non_blocking, workspace);
   op.Process();

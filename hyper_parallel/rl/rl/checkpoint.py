@@ -14,24 +14,51 @@
 # ============================================================================
 """Top-level persistent checkpoint lifecycle for synchronous RL training."""
 
+__all__ = ["RLCheckpointManager"]
+
 import json
 import logging
 import os
 import pickle
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 import yaml
+from transformers import AutoConfig
+
+from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_profile
+from rl.reward_model.scoring import scorer_fingerprint
+from rl.utils.monitoring.config import sanitize_config
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from rl.utils.monitoring.config import sanitize_config
 
 logger = logging.getLogger(__name__)
+
+
+def _rank_local_optimizer_state(value: Any) -> Any:
+    """Serialize local optimizer shards without pickling distributed tensor layouts."""
+    if isinstance(value, torch.Tensor):
+        return getattr(value, "_local_tensor", value).detach()
+    if isinstance(value, Mapping):
+        return {key: _rank_local_optimizer_state(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_rank_local_optimizer_state(item) for item in value)
+    if isinstance(value, list):
+        return [_rank_local_optimizer_state(item) for item in value]
+    return value
+
+
+def _optimizer_topology(config: Mapping[str, Any]) -> dict[str, int]:
+    """Identify the partitioning required to restore rank-local optimizer shards."""
+    accelerator = config.get("train", {}).get("accelerator", {})
+    return {name: int(accelerator.get(name, 1)) for name in (
+        "dp_replicate", "dp_shard", "tp", "cp", "pp", "ep", "edp_shard")}
 
 
 def _clone_shared_checkpoint_tensors(
@@ -100,6 +127,18 @@ class RLCheckpointManager:
         final = bool(self.config.get("save_final", True)) and step == self.trainer.state.max_steps
         return periodic or final
 
+    def _validate_optimizer_manifest(self, manifest: Mapping[str, Any]) -> None:
+        """Reject incompatible optimizer precision and partitioning on resume."""
+        main_params = self.resolved_config.get("train", {}).get("optimizer", {}).get("fp32_main_params", False)
+        if manifest.get("optimizer_fp32_main_params", False) is not main_params:
+            raise RuntimeError("Checkpoint optimizer main-parameter precision policy differs")
+        if manifest.get("training_consistency_profile", CONSISTENCY_PROFILE_OFF) != consistency_profile(
+                self.resolved_config):
+            raise RuntimeError("Checkpoint training numerical consistency recipe differs")
+        topology = manifest.get("optimizer_parallel_topology")
+        if (main_params or topology is not None) and topology != _optimizer_topology(self.resolved_config):
+            raise RuntimeError("Checkpoint rank-local optimizer parallel topology differs")
+
     def validate_resume(self) -> None:
         """Reject incomplete or topology-incompatible checkpoints before loading."""
         if not self.load_path:
@@ -117,6 +156,8 @@ class RLCheckpointManager:
                 )
             with manifest_path.open(encoding="utf-8") as handle:
                 manifest = json.load(handle)
+            if not isinstance(manifest, dict):
+                raise RuntimeError("Checkpoint completion manifest must be an object")
             world_size = dist.get_world_size()
             if int(manifest.get("world_size", -1)) != world_size:
                 raise RuntimeError(
@@ -125,13 +166,40 @@ class RLCheckpointManager:
                 )
             if bool(manifest.get("critic", False)) != (getattr(self.trainer, "critic", None) is not None):
                 raise RuntimeError("Checkpoint Critic ownership does not match the active algorithm")
+            reward_config = self.resolved_config.get("reward_model")
+            expected_scorer = None if reward_config is None else scorer_fingerprint(reward_config)
+            if manifest.get("reward_model_scorer") != expected_scorer:
+                raise RuntimeError("Checkpoint reward model scorer does not match the active configuration")
+            expected_teacher = self._teacher_fingerprint()
+            if manifest.get("distillation_fingerprint") != expected_teacher:
+                raise RuntimeError("Checkpoint distillation objective or teacher identity differs")
+            self._validate_optimizer_manifest(manifest)
             rank_state = checkpoint_dir / f"rank_{dist.get_rank()}"
             if not rank_state.is_dir():
                 raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
             if not (checkpoint_dir / "extra_state.json").is_file():
                 raise RuntimeError(f"Checkpoint training progress is missing: {checkpoint_dir}")
+            with (checkpoint_dir / "extra_state.json").open(encoding="utf-8") as handle:
+                progress = json.load(handle)
+            if not isinstance(progress, dict):
+                raise RuntimeError("Checkpoint training progress must be an object")
+            step = progress.get("global_step")
+            manifest_step = manifest.get("step")
+            if (any(not isinstance(value, int) or isinstance(value, bool) for value in (step, manifest_step))
+                    or step < 0 or manifest_step != step):
+                raise RuntimeError("Checkpoint manifest step and training global_step must match nonnegative integers")
 
         self.run_synchronized("checkpoint resume preflight", validate_files)
+
+    def _teacher_fingerprint(self) -> Optional[str]:
+        """Use the identity captured at startup without rereading teacher weights."""
+        if not (self.resolved_config.get("distillation") or {}).get("enabled", False):
+            return None
+        manager = getattr(self.trainer, "teacher_manager", None)
+        fingerprint = getattr(manager, "fingerprint", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise RuntimeError("Checkpoint requires a validated teacher weight identity")
+        return fingerprint
 
     def begin(self, state: Any) -> None:
         """Restore policy, optimizer, scheduler, RNG, dataloader, and progress state."""
@@ -265,7 +333,7 @@ class RLCheckpointManager:
             critic = getattr(self.trainer, "critic", None)
             if critic is not None:
                 with SkipDTensorDispatch():
-                    rank_state["critic_optimizer"] = critic.optimizer.state_dict()
+                    rank_state["critic_optimizer"] = _rank_local_optimizer_state(critic.optimizer.state_dict())
                 if critic.lr_scheduler is not None:
                     rank_state["critic_scheduler"] = critic.lr_scheduler.state_dict()
             dcp_save(
@@ -285,6 +353,22 @@ class RLCheckpointManager:
         def export() -> None:
             """All ranks gather; only the writing rank saves tokenizer files."""
             model_config = self.trainer.model.config
+            registration = self.trainer.model_registration
+            export_config = model_config
+            actor_architecture = registration.hf_architecture
+            if getattr(registration, "family", None) == "qwen3_5":
+                # Text Actor weights revert to the original conditional namespace.
+                # Its outer HF configuration must keep the matching model identity.
+                export_config = AutoConfig.from_pretrained(
+                    registration.weights_path, local_files_only=True, trust_remote_code=False,
+                )
+                if model_config.model_type != registration.text_model_type:
+                    raise ValueError("Qwen3.5 Actor configuration must describe the checkpoint text model")
+                if export_config.model_type != registration.model_type:
+                    raise ValueError("Qwen3.5 export configuration must retain the checkpoint model type")
+                actor_architecture = "Qwen3_5ForCausalLM"
+                export_config.text_config = deepcopy(model_config)
+                export_config.text_config.architectures = [actor_architecture]
             try:
                 wrote_weights = CheckpointManager(self.trainer.model).save_pretrained(
                     export_dir,
@@ -293,9 +377,10 @@ class RLCheckpointManager:
             finally:
                 # Transformers serializes the dynamic HSDP class name; inference
                 # loaders need the original architecture registered for this model.
-                model_config.architectures = [self.trainer.model_registration.hf_architecture]
+                model_config.architectures = [actor_architecture]
             if wrote_weights:
-                model_config.save_pretrained(export_dir)
+                export_config.architectures = [registration.hf_architecture]
+                export_config.save_pretrained(export_dir)
                 self.trainer.tokenizer.save_pretrained(str(export_dir))
 
         self.run_synchronized("checkpoint HF export", export)
@@ -304,7 +389,7 @@ class RLCheckpointManager:
     def _optimizer_state_dict(self) -> dict[str, Any]:
         """Export optimizer state without dispatching its fused initialization step."""
         with SkipDTensorDispatch():
-            return self.trainer.optimizer.state_dict()
+            return _rank_local_optimizer_state(self.trainer.optimizer.state_dict())
 
     def _write_metadata(self, checkpoint_dir: Path, state: Any) -> None:
         """Persist resolved configuration and publish the completion marker."""
@@ -340,7 +425,14 @@ class RLCheckpointManager:
             with temporary.open("w", encoding="utf-8") as handle:
                 json.dump(
                     {"step": step, "world_size": dist.get_world_size(),
-                     "critic": getattr(self.trainer, "critic", None) is not None},
+                     "critic": getattr(self.trainer, "critic", None) is not None,
+                     "reward_model_scorer": (None if "reward_model" not in self.resolved_config
+                                             else scorer_fingerprint(self.resolved_config["reward_model"])),
+                     "distillation_fingerprint": self._teacher_fingerprint(),
+                     "optimizer_fp32_main_params": self.resolved_config.get("train", {}).get(
+                         "optimizer", {}).get("fp32_main_params", False),
+                     "optimizer_parallel_topology": _optimizer_topology(self.resolved_config),
+                     "training_consistency_profile": consistency_profile(self.resolved_config)},
                     handle,
                 )
             os.replace(temporary, manifest_path)
@@ -369,6 +461,3 @@ class RLCheckpointManager:
             dist.get_rank(),
             checkpoint_dir,
         )
-
-
-__all__ = ["RLCheckpointManager"]

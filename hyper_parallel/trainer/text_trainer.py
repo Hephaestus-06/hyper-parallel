@@ -14,13 +14,13 @@
 # limitations under the License.
 """Text Trainer assembled from the shared BaseTrainer stages."""
 
+__all__ = ["TextTrainer"]
+
 from collections import defaultdict
 from typing import Any, Dict
 
 import torch  # pylint: disable=forbidden-backend-import
 
-from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data.batching import calculate_num_micro_batches
 from hyper_parallel.data.text import build_chat_template
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
@@ -58,11 +58,14 @@ class TextTrainer:
 
         # get_batch
         self._build_get_batch()
+        self.base.attach_model_integration_data_pipeline()
         self.base._compute_train_iters()
 
         self.base._build_optimizer()
+        self.base.model_integration.attach_optimizer(self.base.optimizer)
         self.base._build_lr_scheduler()
         self.base._build_training_context()
+        self.base._build_graph_compiler()
         self.base._init_callbacks()
 
     def _build_model_assets(self) -> None:
@@ -130,7 +133,7 @@ class TextTrainer:
         )
 
     def _build_get_batch(self) -> None:
-        """Build the DataLoader-to-LLM batch adapter."""
+        """Build the DataLoader-to-LLM batch runtime."""
         config = self.base.config
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
@@ -178,13 +181,27 @@ class TextTrainer:
         """Dispatch the step-begin lifecycle hook."""
         self.base.on_step_begin()
 
+    def on_micro_step_begin(self, micro_batch: dict[str, Any]) -> None:
+        """Dispatch the micro-step-begin lifecycle hook.
+
+        Args:
+            micro_batch: Prepared inputs and lightweight metric metadata.
+        """
+        self.base.on_micro_step_begin(micro_batch)
+
     def on_step_end(
             self,
             loss: Any = None,
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregated loss for the optimizer step.
+            loss_dict: Named loss values for the optimizer step.
+            grad_norm: Gradient norm measured before the optimizer update.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
@@ -211,17 +228,30 @@ class TextTrainer:
             name: token_count * num_micro_steps
             for name, token_count in self.base.current_token_counts.items()
         }
+        metric_inputs = {
+            **model_inputs,
+            **loss_inputs,
+            "token_count": self.base.current_token_counts["foundation_tokens"],
+        }
+        self.on_micro_step_begin(metric_inputs)
+        del metric_inputs
         loss, loss_dict = self.base.forward_backward_step(model_inputs, loss_inputs)
 
         return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one text training step."""
-        config = self.base.config
+        """Execute one text training step.
+
+        Args:
+            data_iterator: Iterator providing the step's micro-batches.
+
+        Returns:
+            Aggregated loss and gradient norm for the completed step.
+        """
         num_micro_steps = self.base.num_micro_batches
-        optimizers = self.base.optimizer if isinstance(self.base.optimizer, list) else [self.base.optimizer]
 
         self.on_step_begin()
+        self.base.model_integration.begin_step(self.base.state.global_step + 1)
         synchronize()
 
         total_loss = 0.0
@@ -233,6 +263,7 @@ class TextTrainer:
                 micro_step,
                 num_micro_steps,
             )
+            self.base.begin_fsdp_runtime_diagnostics(micro_step)
             loss, loss_dict = self.forward_backward_step(
                 data_iterator,
                 num_micro_steps,
@@ -242,34 +273,16 @@ class TextTrainer:
             for loss_name, loss_value in loss_dict.items():
                 total_loss_dict[loss_name] += loss_value.item()
 
-        grad_norm = 0.0
-        if config.training.max_grad_norm > 0:
-            grad_norm = clip_grad_norm_(
-                self.base.model,
-                config.training.max_grad_norm,
-            )
-
-        for optimizer in optimizers:
-            with SkipDTensorDispatch(no_skip={torch.zeros_like}):
-                optimizer.step()
-            optimizer.zero_grad()
-
-        schedulers = (
-            self.base.lr_scheduler
-            if isinstance(self.base.lr_scheduler, list)
-            else (
-                [self.base.lr_scheduler]
-                if self.base.lr_scheduler is not None
-                else []
-            )
-        )
-        for scheduler in schedulers:
-            scheduler.step()
+        grad_norm = self.base.prepare_optimizer_step()
+        self.base.step_optimizers_and_schedulers()
 
         # Checkpoint and logging callbacks observe the number of completed
         # optimizer updates.
         self.base.state.global_step += 1
         grad_norm_value = float(grad_norm)
+        self.base._end_model_integration_step(  # pylint: disable=protected-access
+            {"loss": total_loss, "grad_norm": grad_norm_value}
+        )
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
@@ -322,6 +335,3 @@ class TextTrainer:
 
         synchronize()
         self.base.destroy_distributed()
-
-
-__all__ = ["TextTrainer"]

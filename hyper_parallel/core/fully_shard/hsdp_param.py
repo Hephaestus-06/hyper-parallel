@@ -263,13 +263,13 @@ class HSDPParamV2:
             # pre-dedup behavior.
             return source_mesh, source_placements
 
-        storage_dim_names = tuple(
-            dim_name
-            for dim_index, dim_name in enumerate(source_mesh_dim_names)
+        storage_dim_names = []
+        for dim_index, dim_name in enumerate(source_mesh_dim_names):
             if not self._source_dim_covered_by_fsdp(
                 source_mesh, dim_index, coordinate, fsdp_ranks
-            )
-        )
+            ):
+                storage_dim_names.append(dim_name)
+        storage_dim_names = tuple(storage_dim_names)
         if not storage_dim_names or storage_dim_names == source_mesh_dim_names:
             return source_mesh, source_placements
 
@@ -449,7 +449,8 @@ class HSDPParamV2:
         """Clear the all-reduce output tensor to free memory."""
         self.all_reduce_comm_ctx.all_reduce_output = None
 
-    def clear_unsharded_source_grad(self):
+    def clear_unsharded_source_grad(self) -> None:
+        """Clear the live unsharded gradient or its accumulated buffer."""
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad = None
         elif self.unsharded_param.grad is not None:
@@ -758,12 +759,14 @@ class HSDPParamV2:
         )
 
     def to_sharded(self) -> None:
+        """Install the sharded parameter on managed modules and update state."""
         self._setattr_on_modules(self.sharded_param)
         if self.unsharded_param_buffers[0] is not self._sharded_param_data:
             self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
+        """Install the unsharded parameter on managed modules and update state."""
         set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
         self._setattr_on_modules(self._unsharded_param)
         self.sharded_state = ShardedState.UNSHARDED
@@ -804,6 +807,7 @@ class HSDPParamV2:
         return sharded_dtensor
 
     def to_accumulated_grad_if_needed(self) -> None:
+        """Move the current unsharded gradient into the accumulation buffer."""
         if self._unsharded_param.grad is None:
             return
         # Keep local gradients alive across no-sync / delayed-sync steps even
@@ -818,6 +822,7 @@ class HSDPParamV2:
             self.unsharded_accumulated_grad += unsharded_grad
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
+        """Add the current unsharded gradient to an existing accumulation buffer."""
         if (
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
@@ -947,11 +952,16 @@ class HSDPParamV2:
         shard_dim: int,
     ) -> None:
         """Rebuild padded communication storage and refresh the DTensor local view."""
+        # A converted parameter may still reference the forward graph through
+        # DTensor's local TensorImpl.  Storage owned by HSDP must be an
+        # off-graph leaf so this reference cannot retain the previous device
+        # allocation after an offload or parameter conversion.
+        local_tensor = local_tensor.detach()
         actual_shard_length = self.sharded_size[shard_dim]
         if self.sharded_size == self.padded_sharded_param_size:
             local_tensor = local_tensor.contiguous()
             self._sharded_param_data = local_tensor.view(-1)
-            local_view = local_tensor.detach()
+            local_view = local_tensor
         else:
             padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
             if self.pin_memory:
@@ -967,7 +977,7 @@ class HSDPParamV2:
                 shard_dim,
                 0,
                 actual_shard_length,
-            ).detach()
+            )
         set_requires_grad_if_needed(self.sharded_param, local_view)
         self.sharded_param._local_tensor = local_view
         self._update_shardedparam_storage_forcely()
@@ -977,7 +987,12 @@ class HSDPParamV2:
             )
 
     def reset_sharded_param(self) -> None:
-        """Reset sharded param after load_state_dict."""
+        """Reset sharded param after load_state_dict.
+
+        This method may replace the DTensor local storage.  It intentionally
+        detaches the rebuilt persistent storage from autograd because it is
+        not part of a forward computation.
+        """
         new_param = self._resolve_reset_param()
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
@@ -1079,6 +1094,11 @@ class HSDPParamV2:
 
 
     def unshard(self, async_op: bool = False) -> None:
+        """Start gathering the full parameter when no gather is already pending.
+
+        Args:
+            async_op: Whether to launch the all-gather asynchronously.
+        """
         if self.allgather_comm_ctx.allgather_handle is not None:
             # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
@@ -1086,6 +1106,7 @@ class HSDPParamV2:
 
 
     def wait_for_unshard(self) -> None:
+        """Wait for the parameter all-gather and expose the unsharded parameter."""
         self._assert_in_states(ShardedState.SHARDED)
 
         if self.allgather_comm_ctx.allgather_handle is not None:
@@ -1119,21 +1140,21 @@ class HSDPParamV2:
                           enabling zero-copy fusion with subsequent all_reduce operations.
                           The buffer must have ``padded_sharded_param_size.numel()`` elements
                           and the reduction dtype.
-
-        The output and optional asynchronous work are stored in
-        ``reduce_scatter_comm_ctx``.
         """
         if self.unsharded_accumulated_grad is not None:
-            grad = self.unsharded_accumulated_grad_data
+            self._grad = self.unsharded_accumulated_grad_data
+            self.unsharded_accumulated_grad = None
         else:
-            grad = self.unsharded_grad_data
-        self._grad = grad.to(self.reduce_comm_dtype(grad))
+            self._grad = self.unsharded_grad_data
+            self.unsharded_param.grad = None
+        self._grad = self._grad.to(self.reduce_comm_dtype(self._grad))
         shard_dim = self.hsdp_placement.dim
         if self.shard_world_size <= 1:
             self._grad = self._grad.view(-1)
         elif shard_dim != 0:
             grad_chunks = torch.chunk(self._grad, self.shard_world_size, dim=shard_dim)
             self._grad = torch.cat(grad_chunks, dim=0).contiguous().view(-1)
+            grad_chunks = None
         else:
             padded_unsharded_dim0 = self.padded_sharded_param_size[0] * self.shard_world_size
             if self._grad.size(0) != padded_unsharded_dim0:
@@ -1152,6 +1173,7 @@ class HSDPParamV2:
             else:
                 self.reduce_scatter_comm_ctx.reduce_scatter_output = self._grad
             self.reduce_scatter_comm_ctx.reduce_scatter_handle = None
+            self._grad = None
             return
 
         # Calculate output size
@@ -1181,6 +1203,8 @@ class HSDPParamV2:
             group=shard_process_group,
             async_op=async_op,
         )
+        if not async_op:
+            self._grad = None
 
     def all_reduce_grad(
         self,

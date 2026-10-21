@@ -20,6 +20,8 @@
 # pylint: disable=abstract-method,arguments-differ
 from __future__ import annotations
 
+__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]
+
 from typing import NamedTuple, Optional
 
 import torch
@@ -38,7 +40,7 @@ from hyper_parallel.components.modules.gated_delta_net import (
     is_triton_gdn_available,
     torch_chunk_gated_delta_rule,
 )
-from hyper_parallel.distributed import _collectives
+from hyper_parallel.core.utils import communication
 
 
 _GDN_BACKENDS = frozenset({"eager", "triton"})
@@ -161,7 +163,7 @@ def _all_to_all_previous_rank_halo(
     if cp_rank > 0:
         output_splits[rank_to_group_index[rank_list[cp_rank - 1]]] = halo_width
 
-    exchange_output = _collectives.differentiable_all_to_all_single(
+    exchange_output = communication.differentiable_all_to_all_single(
         exchange_input,
         input_splits,
         output_splits,
@@ -448,6 +450,7 @@ class _RecvInitialStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_state: Optional[torch.Tensor]):
+        """Return the incoming state gradient to the preceding CP rank."""
         if grad_state is None:
             raise RuntimeError("linear attention P2P backward missing initial-state grad.")
         dist.send(grad_state.contiguous(), dst=ctx.prev_rank, group=ctx.cp_group)
@@ -474,6 +477,7 @@ class _SendFinalStateP2PFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_token: torch.Tensor):
+        """Receive the final-state gradient from the succeeding CP rank."""
         grad_state = torch.empty(
             ctx.state_shape,
             device=grad_token.device,
@@ -907,7 +911,7 @@ def _differentiable_all_to_all_shard(
     split_len = a2a_input.shape[0] // split_count
     input_splits = [split_len] * split_count
     output_splits = [split_len] * split_count
-    output = _collectives.differentiable_all_to_all_single(
+    output = communication.differentiable_all_to_all_single(
         a2a_input,
         input_splits,
         output_splits,
@@ -1364,7 +1368,3 @@ class GatedDeltaNetP2PCP(nn.Module):
         if hasattr(base, "out_proj_input"):
             core_attn_out = base.out_proj_input(core_attn_out)
         return base.out_proj(core_attn_out)
-
-
-
-__all__ = ["GatedDeltaNetP2PCP", "GatedDeltaNetUlyssesCP"]

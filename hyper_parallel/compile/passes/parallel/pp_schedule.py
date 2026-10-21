@@ -17,63 +17,92 @@ PP Schedules - Graph-mode pipeline schedule drivers.
 
 Single module per the house convention (``core/pipeline_parallel/scheduler.py``
 keeps its eager-mode schedules the same way): shared P2P / microbatch
-machinery plus one class per algorithm — ``ScheduleGPipe`` today;
-``Schedule1F1B`` etc. land here as follow-ups, dispatched by name from
-``PassConfig``.
+machinery in :class:`PipelineScheduleBase` plus one class per algorithm —
+:class:`ScheduleGPipe` and :class:`Schedule1F1B` today — dispatched by name
+from :data:`SCHEDULE_REGISTRY` / ``PassConfig.pp_schedule``.
 
-``ScheduleGPipe`` runs the per-stage FX subgraphs produced by ``PpPass``
-across microbatches:
+Both schedules run the per-stage FX subgraphs produced by ``PpPass`` across
+microbatches and share the same P2P / loss / gradient contract:
 
-1. Forward sweep: stage 0 slices the step batch into microbatches and runs
-   its forward subgraph per microbatch, sending each boundary value list to
-   the next stage with async ``dist.isend``; intermediate stages receive,
-   compute, and forward; the last stage additionally computes the
-   per-microbatch loss.
-2. Backward sweep (reverse order): the last stage feeds ``ones_like(loss)``
-   into its backward subgraph, accumulates parameter gradients and sends
-   the boundary gradients to the previous stage; earlier stages receive the
-   gradients, run their backward subgraph against the activations saved
-   from the forward sweep, and pass their boundary gradients one stage
-   back.
+- Model inputs are routed by dataflow: each user input is owned by the single
+  stage that consumes it (resolved by ``PpPass``) and is fed to that stage's
+  forward subgraph directly — every rank receives the full flattened
+  user-input list, slices its OWNED tensor inputs per microbatch, and ignores
+  the rest. All tensor user inputs must carry the leading batch dim.
+- Boundary values are exchanged as ORDERED LISTS: tensors go as-is, int
+  scalars (dynamic-shape ``sym_size`` nodes crossing the cut) are packed as
+  0-d int64 tensors and unwrapped with ``item()`` on arrival — mirroring how
+  ``torch.distributed.pipelining``'s ``PipelineStage`` ships full argument
+  lists. The P2P exchange uses eager ``dist.isend``/``irecv`` on the PP
+  process group; sends are async so the sweeps overlap receive/compute across
+  stages, receives wait before first use, and each microbatch's boundary sends
+  are retained under that microbatch's key — forward and backward boundaries
+  share the key — until their ``Work`` handles are waited (1F1B: one turn
+  after the backward posts, so a forward send rides along; GPipe: at the end
+  of the step).
+- Microbatch gradients are un-normalized sums while sweeping, then divided by
+  ``num_microbatches`` at the end, so the step gradient matches the non-PP
+  semantics of a full-batch mean loss.
 
-Boundary values are exchanged as ORDERED LISTS: tensors go as-is, int
-scalars (dynamic-shape ``sym_size`` nodes crossing the cut) are packed as
-0-d int64 tensors and unwrapped with ``item()`` on arrival — mirroring how
-``torch.distributed.pipelining``'s ``PipelineStage`` ships full argument
-lists. The P2P exchange uses eager ``dist.isend``/``irecv`` on the PP
-process group; sends are async (``Work`` handles waited at the end of the
-step) so the forward sweep overlaps receive/compute across stages,
-receives wait before first use.
+The schedules differ in their action order — and in the activation lifetime
+that order allows:
 
-Microbatch gradients are un-normalized sums while sweeping, then divided by
-``num_microbatches`` at the end, so the step gradient matches the non-PP
-semantics of a full-batch mean loss.
+``ScheduleGPipe``
+    1. Forward sweep: run every microbatch's forward (shipping boundary
+       activations downstream), holding all forward outputs.
+    2. Backward sweep (reverse order): seed ``ones_like(loss)`` on the last
+       stage, run each backward against the activations saved by the forward
+       sweep, and pass boundary gradients one stage back.
+
+``Schedule1F1B``
+    Warmup runs ``min(num_microbatches, pp_degree - stage_idx)`` forwards (a
+    stage nearer the front keeps one more microbatch in flight), then the
+    steady state alternates one backward with one forward per turn, and a
+    cooldown drains the remaining backwards. Interleaving backward earlier
+    shrinks the pipeline bubble relative to GPipe. Requires
+    ``num_microbatches >= pp_degree``.
+
+Forward activations and backward gradients share one PP process group, whose
+per-pair FIFO must stay complementary — at each position one end sends while
+the other receives — or the group deadlocks. ``Schedule1F1B`` staggers its
+boundary sends to hold that invariant despite the ``pp_degree``-asymmetric
+warmup; the placement mirrors ``core/pipeline_parallel/scheduler.py`` and is
+spelled out in ``Schedule1F1B.forward``.
 """
 
-__all__ = ["ScheduleGPipe"]
+__all__ = [
+    "PipelineScheduleBase",
+    "ScheduleGPipe",
+    "Schedule1F1B",
+    "SCHEDULE_REGISTRY",
+    "get_schedule_class",
+]
 
-from typing import Any, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, Type
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 
-class ScheduleGPipe(nn.Module):
-    """GPipe driver over two per-stage FX subgraphs (forward / backward).
+class PipelineScheduleBase(nn.Module):
+    """Shared P2P / microbatch machinery for the graph-mode PP schedules.
 
     Installed by ``PpPass`` as a submodule of the compiled GraphModule and
     invoked through a ``call_module`` node, so the trainer's
-    ``graph_module(*flat_inputs)`` dispatches here unchanged.
+    ``graph_module(*flat_inputs)`` dispatches to the concrete schedule
+    unchanged. Subclasses implement :meth:`forward` (the action order) from
+    the per-microbatch building blocks defined here.
 
     Args:
         fwd_gm: Stage forward subgraph. Signature per stage:
-            stage 0    -> ``(*state, input_mb)`` returning
+            stage 0    -> ``(*state, *owned_inputs)`` returning
                           ``(*act_out, *saved)``;
-            middle     -> ``(*state, *act_in)`` returning
-                          ``(*act_out, *saved)``;
-            last       -> ``(*state, *act_in, label_mb)`` returning
-                          ``(loss, *saved)``.
+            other      -> ``(*state, *act_in, *owned_inputs)`` returning
+                          ``(*act_out, *saved)`` for non-last stages and
+                          ``(loss, *saved)`` for the last one, where
+                          ``owned_inputs`` are the user inputs routed to
+                          this stage (may be empty).
         bwd_gm: Stage backward subgraph. Signature:
             ``(*state, *grad_in, *fwd_outs)`` where ``grad_in`` are the
             received boundary gradients (``ones_like(loss)`` on the last
@@ -91,19 +120,16 @@ class ScheduleGPipe(nn.Module):
         grad_send_count: Number of backward boundary values to ship
             upstream (the backward outputs' suffix); 0 on stage 0.
         microbatch_size: Samples per microbatch (leading dim).
-        pp_group: PP process group object used for isend/irecv.
+        pp_group: PP process group used for all boundary P2P (activations and
+            gradients) and for stage->global rank mapping.
         recv_spec: Per-value descriptors for the incoming forward
             boundary: ``("tensor", shape, dtype, device)`` or
             ``("scalar",)``. Empty on stage 0.
         grad_recv_spec: Same, for the incoming backward boundary
             gradients. Empty on the last stage.
-
-    Note:
-        GPipe runs ALL forwards before ANY backward, so every microbatch's
-        forward outputs (boundary activations + saved values) are held
-        until the backward sweep completes — activation memory scales with
-        ``num_microbatches``. Larger ``microbatch_size`` trades pipeline
-        bubble for fewer P2P round-trips and fewer retained activations.
+        user_input_stages: Per flattened user input (stub arg order), the
+            stage that consumes it. This stage slices and feeds the inputs
+            mapped to itself and ignores the rest.
     """
 
     def __init__(
@@ -120,6 +146,7 @@ class ScheduleGPipe(nn.Module):
         pp_group: Any = None,
         recv_spec: Sequence[Tuple[Any, ...]] = (),
         grad_recv_spec: Sequence[Tuple[Any, ...]] = (),
+        user_input_stages: Sequence[int] = (),
     ) -> None:
         """Store the stage subgraphs, P2P group, and boundary specs."""
         super().__init__()
@@ -135,137 +162,228 @@ class ScheduleGPipe(nn.Module):
         self.pp_group = pp_group
         self.recv_spec = list(recv_spec)
         self.grad_recv_spec = list(grad_recv_spec)
+        self.user_input_stages = list(user_input_stages)
         self.is_first = stage_idx == 0
         self.is_last = stage_idx == pp_degree - 1
-        # Work handles of in-flight isend ops; tensors are kept referenced
-        # so the underlying buffers stay alive until the send completes.
-        self._pending_sends: List[Tuple[Any, torch.Tensor]] = []
+        # In-flight isend Work handles keyed by microbatch index — forward and
+        # backward boundaries of one microbatch share the key; the sent
+        # tensors stay referenced so their buffers outlive the send. Schedules
+        # release a microbatch's buffers once its sends provably completed
+        # (1F1B: next turn's gradient receipt) or at the end of the step.
+        self._pending_sends: Dict[int, List[Tuple[Any, torch.Tensor]]] = {}
 
-    def forward(self, *flat_inputs: Any) -> Tuple[torch.Tensor, ...]:
-        """Run one full GPipe step (fwd sweep then bwd sweep).
+    # ------------------------------------------------------------------
+    # Input / microbatch resolution
+    # ------------------------------------------------------------------
 
-        Args:
-            flat_inputs: ``(*state, input_batch, label_batch)`` — the same
-                surface ``run_traced_graph`` feeds the compiled graph.
-
-        Returns:
-            ``(loss, *param_grads)``. On non-last stages the loss is a zero
-            scalar placeholder (the real loss lives on the last stage);
-            parameter gradients are the microbatch-averaged accumulation.
-        """
+    def _split_inputs(
+        self, flat_inputs: Sequence[Any]
+    ) -> Tuple[Sequence[Any], List[Any]]:
+        """Split ``(*state, *user_inputs)`` and validate the input arity."""
         state = flat_inputs[: self.num_state]
-        input_batch = flat_inputs[-2]
-        label_batch = flat_inputs[-1]
+        user_inputs = list(flat_inputs[self.num_state :])
+        if len(user_inputs) != len(self.user_input_stages):
+            raise RuntimeError(
+                f"PP schedule expects {len(self.user_input_stages)} user "
+                f"inputs (per its routing) but received {len(user_inputs)}"
+            )
+        return state, user_inputs
 
-        batch_size = input_batch.shape[0]
+    def _resolve_microbatches(
+        self, user_inputs: Sequence[Any]
+    ) -> Tuple[int, List[Any]]:
+        """Derive the microbatch count and this stage's owned user inputs.
+
+        Every rank receives every user input, so the batch size is derived
+        identically on all stages from the first tensor input.
+        """
+        batch_size = next(
+            (v.shape[0] for v in user_inputs if isinstance(v, torch.Tensor)), None
+        )
+        if batch_size is None:
+            raise ValueError(
+                "PP requires at least one tensor model input to derive the "
+                "microbatch split"
+            )
         if batch_size % self.microbatch_size != 0:
             raise ValueError(
                 f"PP microbatch mismatch: batch size {batch_size} is not "
                 f"divisible by pp_microbatch_size {self.microbatch_size}"
             )
         num_microbatches = batch_size // self.microbatch_size
+        owned_inputs = [
+            v
+            for v, s in zip(user_inputs, self.user_input_stages)
+            if s == self.stage_idx
+        ]
+        return num_microbatches, owned_inputs
 
-        fwd_outs_per_mb = self._forward_sweep(
-            state, input_batch, label_batch, num_microbatches
-        )
-        grads = self._backward_sweep(state, fwd_outs_per_mb, num_microbatches)
+    def _slice_inputs(self, owned_inputs: Sequence[Any], mb_index: int) -> List[Any]:
+        """Slice this stage's owned inputs for microbatch ``mb_index``.
 
-        for work, _ in self._pending_sends:
-            work.wait()
-        self._pending_sends = []
+        Tensors are sliced along the leading batch dim; non-tensors pass
+        through unchanged.
+        """
+        lo = mb_index * self.microbatch_size
+        hi = lo + self.microbatch_size
+        return [v[lo:hi] if isinstance(v, torch.Tensor) else v for v in owned_inputs]
 
+    # ------------------------------------------------------------------
+    # Per-microbatch building blocks
+    # ------------------------------------------------------------------
+    #
+    # Forward / backward are split into a receive step and a compute step so
+    # a schedule can interleave boundary sends with compute independently;
+    # ``_forward_microbatch`` / ``_backward_microbatch`` compose them for
+    # callers that don't need that control.
+
+    def _recv_activation(self) -> List[Any]:
+        """Receive this stage's incoming boundary activations (none on stage 0)."""
+        if self.is_first:
+            return []
+        return self._recv_values(self.recv_spec, src=self.stage_idx - 1)
+
+    def _apply_forward(
+        self,
+        state: Sequence[Any],
+        act_in: Sequence[Any],
+        owned_inputs: Sequence[Any],
+        mb_index: int,
+    ) -> Tuple[Any, ...]:
+        """Run one microbatch's forward subgraph against ``act_in``.
+
+        ``owned_inputs`` are this stage's user inputs (see
+        ``user_input_stages``): tensors are sliced per microbatch along the
+        leading batch dim, non-tensors pass through. They are appended after
+        the received activations in the fwd subgraph's arg order.
+        """
+        owned_mb = self._slice_inputs(owned_inputs, mb_index)
+        if self.is_first:
+            out = self.fwd_gm(*state, *owned_mb)
+        else:
+            out = self.fwd_gm(*state, *act_in, *owned_mb)
+        return tuple(out)
+
+    def _forward_microbatch(
+        self, state: Sequence[Any], owned_inputs: Sequence[Any], mb_index: int
+    ) -> Tuple[Any, ...]:
+        """Receive activations then run one microbatch's forward subgraph."""
+        act_in = self._recv_activation()
+        return self._apply_forward(state, act_in, owned_inputs, mb_index)
+
+    def _send_forward(self, out: Sequence[Any], mb_index: int) -> None:
+        """Ship microbatch ``mb_index``'s boundary activations downstream."""
+        if self.num_send:
+            self._send_values(
+                out[: self.num_send], dst=self.stage_idx + 1, mb_index=mb_index
+            )
+
+    def _recv_gradient(self, fwd_outs: Sequence[Any]) -> List[Any]:
+        """Receive the next stage's output grads (a seed on the last stage).
+
+        The traced backward graph seeds its own loss gradient internally, so
+        the ``ones_like`` seed on the last stage only fixes the shape.
+        """
+        if self.is_last:
+            return [torch.ones_like(fwd_outs[0])]
+        return self._recv_values(self.grad_recv_spec, src=self.stage_idx + 1)
+
+    def _apply_backward(
+        self,
+        state: Sequence[Any],
+        grad_in: Sequence[Any],
+        fwd_outs: Sequence[Any],
+        mb_index: int,
+    ) -> Sequence[torch.Tensor]:
+        """Run microbatch ``mb_index``'s backward subgraph and ship grads.
+
+        Gradients flow UPSTREAM, so the previous stage is the destination,
+        mirroring the forward direction. The grads returned are un-normalized
+        sums over the microbatches; the shipped boundary grads are keyed by
+        ``mb_index`` so the schedule can release their buffers later.
+        """
+        out = self.bwd_gm(*state, *grad_in, *fwd_outs)
+        param_grads = out[: self.num_trainable]
+        if self.grad_send_count:
+            self._send_values(
+                out[self.num_trainable :], dst=self.stage_idx - 1, mb_index=mb_index
+            )
+        return param_grads
+
+    def _backward_microbatch(
+        self, state: Sequence[Any], fwd_outs: Sequence[Any], mb_index: int
+    ) -> Sequence[torch.Tensor]:
+        """Receive boundary grads then run one microbatch's backward subgraph."""
+        grad_in = self._recv_gradient(fwd_outs)
+        return self._apply_backward(state, grad_in, fwd_outs, mb_index)
+
+    @staticmethod
+    def _accumulate_grads(
+        accumulated: Sequence[torch.Tensor], param_grads: Sequence[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        """Sum one microbatch's param grads into the running accumulation."""
+        if not accumulated:
+            return list(param_grads)
+        return [acc + grad for acc, grad in zip(accumulated, param_grads)]
+
+    def _finalize_loss(
+        self, fwd_outs_per_mb: Sequence[Sequence[Any]], user_inputs: Sequence[Any]
+    ) -> torch.Tensor:
+        """Return the step loss (last stage) or a zero placeholder."""
         if self.is_last:
             # On the last stage each forward output tuple starts with the
             # per-microbatch loss.
             losses = [outs[0] for outs in fwd_outs_per_mb]
-            loss = torch.stack(losses).mean()
-        else:
-            loss = torch.zeros((), device=input_batch.device)
-        return (loss, *grads)
+            return torch.stack(losses).mean()
+        return torch.zeros((), device=self._anchor_device(user_inputs))
 
-    def _forward_sweep(
-        self,
-        state: Sequence[torch.Tensor],
-        input_batch: torch.Tensor,
-        label_batch: torch.Tensor,
-        num_microbatches: int,
-    ) -> List[Tuple[Any, ...]]:
-        """Run forward microbatch 0..N-1, shipping boundary values downstream.
-
-        Returns per-microbatch forward output tuples (replayed verbatim
-        into the backward subgraph by ``_backward_sweep``).
-        """
-        mb = self.microbatch_size
-        fwd_outs_per_mb: List[Tuple[Any, ...]] = []
-
-        for i in range(num_microbatches):
-            lo, hi = i * mb, (i + 1) * mb
-            if self.is_first:
-                out = self.fwd_gm(*state, input_batch[lo:hi])
-            else:
-                # Forward activations arrive from the PREVIOUS stage.
-                act_in = self._recv_values(self.recv_spec, src=self.stage_idx - 1)
-                if self.is_last:
-                    out = self.fwd_gm(*state, *act_in, label_batch[lo:hi])
-                else:
-                    out = self.fwd_gm(*state, *act_in)
-
-            fwd_outs_per_mb.append(tuple(out))
-            if self.num_send:
-                self._send_values(out[: self.num_send], dst=self.stage_idx + 1)
-        return fwd_outs_per_mb
-
-    def _backward_sweep(
-        self,
-        state: Sequence[torch.Tensor],
-        fwd_outs_per_mb: Sequence[Tuple[Any, ...]],
-        num_microbatches: int,
+    @staticmethod
+    def _average_grads(
+        grads: Sequence[torch.Tensor], num_microbatches: int
     ) -> List[torch.Tensor]:
-        """Run backward microbatches N-1..0, accumulating full-batch gradients.
+        """Turn un-normalized sums over microbatches into the mean."""
+        return [grad / num_microbatches for grad in grads]
 
-        The traced backward graph seeds its own loss gradient internally
-        (an ``ones_like`` over the saved loss), so the ``grad_in`` we pass on
-        the last stage is a placeholder — the grads that come back are
-        un-normalized sums over the microbatches. Dividing the accumulation
-        by ``num_microbatches`` turns that into the mean, which is exactly
-        the full-batch mean-loss gradient the non-PP path produces.
+    # ------------------------------------------------------------------
+    # P2P helpers
+    # ------------------------------------------------------------------
+
+    def _flush_pending_sends(self) -> None:
+        """Wait every in-flight isend and drop all buffer references."""
+        for sends in self._pending_sends.values():
+            for work, _ in sends:
+                work.wait()
+        self._pending_sends = {}
+
+    def _wait_sends(self, mb_index: int) -> None:
+        """Wait microbatch ``mb_index``'s in-flight sends, freeing its buffers.
+
+        Callers must only invoke this once the sends are provably complete
+        (e.g. the peer consumed the values), so the wait never blocks.
         """
-        grads: List[torch.Tensor] = []
+        for work, _ in self._pending_sends.pop(mb_index, ()):
+            work.wait()
 
-        for i in reversed(range(num_microbatches)):
-            fwd_outs = fwd_outs_per_mb[i]
-            if self.is_last:
-                # Seed shape only; the traced graph ignores the value.
-                grad_in: List[Any] = [torch.ones_like(fwd_outs[0])]
-            else:
-                # Boundary gradients arrive from the NEXT stage (they flow
-                # upstream during the backward sweep).
-                grad_in = self._recv_values(self.grad_recv_spec, src=self.stage_idx + 1)
-            out = self.bwd_gm(*state, *grad_in, *fwd_outs)
+    @staticmethod
+    def _anchor_device(user_inputs: Sequence[Any]) -> torch.device:
+        """Device for the zero-loss placeholder: first tensor user input."""
+        for value in user_inputs:
+            if isinstance(value, torch.Tensor):
+                return value.device
+        return torch.device("cpu")
 
-            param_grads = out[: self.num_trainable]
-            if not grads:
-                grads = list(param_grads)
-            else:
-                grads = [acc + g for acc, g in zip(grads, param_grads)]
-
-            if self.grad_send_count:
-                # Gradients flow UPSTREAM: the previous stage is the
-                # destination, mirroring the forward direction.
-                self._send_values(out[self.num_trainable :], dst=self.stage_idx - 1)
-        # Un-normalized sums over the microbatches -> mean.
-        return [g / num_microbatches for g in grads]
-
-    def _send_values(self, values: Sequence[Any], dst: int) -> None:
+    def _send_values(self, values: Sequence[Any], dst: int, mb_index: int) -> None:
         """Async-send boundary values to the neighbouring stage ``dst``.
 
         Tensors go as-is (made contiguous, with THAT buffer retained); int
         scalars (dynamic-shape ``sym_size`` nodes) are packed as 0-d int64
         tensors on the first tensor value's device — CPU tensors cannot ride
         an NCCL/NPU-backend group — and unwrapped with ``item()`` on the
-        receiving side. The ``Work`` handles are queued (waited at the end of
-        the step) and the sent tensors kept referenced so their buffers
-        outlive the send.
+        receiving side. The ``Work`` handles are queued under ``mb_index``
+        (forward and backward boundaries of a microbatch share the key) and
+        the sent tensors kept referenced so their buffers outlive the send;
+        the schedule waits them (per turn or at step end) before the buffers
+        are released.
         """
         dst_rank = self._global_rank(dst)
         anchor_device = next(
@@ -277,7 +395,7 @@ class ScheduleGPipe(nn.Module):
             else:
                 tensor = torch.tensor(value, dtype=torch.int64, device=anchor_device)
             work = dist.isend(tensor, dst=dst_rank, group=self.pp_group)
-            self._pending_sends.append((work, tensor))
+            self._pending_sends.setdefault(mb_index, []).append((work, tensor))
 
     def _recv_values(self, spec: Sequence[Tuple[Any, ...]], src: int) -> List[Any]:
         """Receive boundary values from the neighbouring stage ``src``, in order.
@@ -309,3 +427,256 @@ class ScheduleGPipe(nn.Module):
         if self.pp_group is None:
             return stage_idx
         return dist.get_global_rank(self.pp_group, stage_idx)
+
+
+class ScheduleGPipe(PipelineScheduleBase):
+    """GPipe driver over two per-stage FX subgraphs (forward / backward).
+
+    Runs ALL forwards before ANY backward, so every microbatch's forward
+    outputs (boundary activations + saved values) are held until the backward
+    sweep completes — activation memory scales with ``num_microbatches``.
+    Larger ``microbatch_size`` trades pipeline bubble for fewer P2P
+    round-trips and fewer retained activations.
+    """
+
+    def forward(self, *flat_inputs: Any) -> Tuple[torch.Tensor, ...]:
+        """Run one full GPipe step (fwd sweep then bwd sweep).
+
+        Args:
+            flat_inputs: ``(*state, *user_inputs)`` — the same surface
+                ``run_traced_graph`` feeds the compiled graph, with
+                ``user_inputs`` the flattened model inputs in trace order.
+
+        Returns:
+            ``(loss, *param_grads)``. On non-last stages the loss is a zero
+            scalar placeholder (the real loss lives on the last stage);
+            parameter gradients are the microbatch-averaged accumulation.
+        """
+        state, user_inputs = self._split_inputs(flat_inputs)
+        num_microbatches, owned_inputs = self._resolve_microbatches(user_inputs)
+
+        fwd_outs_per_mb = self._forward_sweep(state, owned_inputs, num_microbatches)
+        grads = self._backward_sweep(state, fwd_outs_per_mb, num_microbatches)
+
+        self._flush_pending_sends()
+
+        loss = self._finalize_loss(fwd_outs_per_mb, user_inputs)
+        return (loss, *grads)
+
+    def _forward_sweep(
+        self,
+        state: Sequence[Any],
+        owned_inputs: Sequence[Any],
+        num_microbatches: int,
+    ) -> List[Tuple[Any, ...]]:
+        """Run forward microbatch 0..N-1, shipping boundary values downstream.
+
+        Returns per-microbatch forward output tuples (replayed verbatim
+        into the backward subgraph by ``_backward_sweep``).
+        """
+        fwd_outs_per_mb: List[Tuple[Any, ...]] = []
+        for mb_index in range(num_microbatches):
+            out = self._forward_microbatch(state, owned_inputs, mb_index)
+            fwd_outs_per_mb.append(out)
+            self._send_forward(out, mb_index)
+        return fwd_outs_per_mb
+
+    def _backward_sweep(
+        self,
+        state: Sequence[Any],
+        fwd_outs_per_mb: Sequence[Tuple[Any, ...]],
+        num_microbatches: int,
+    ) -> List[torch.Tensor]:
+        """Run backward microbatches N-1..0, accumulating full-batch gradients.
+
+        The traced backward graph seeds its own loss gradient internally
+        (an ``ones_like`` over the saved loss), so the grads that come back
+        are un-normalized sums over the microbatches. Dividing the
+        accumulation by ``num_microbatches`` turns that into the mean, which
+        is exactly the full-batch mean-loss gradient the non-PP path
+        produces.
+        """
+        grads: List[torch.Tensor] = []
+        for mb_index in reversed(range(num_microbatches)):
+            grads = self._accumulate_grads(
+                grads,
+                self._backward_microbatch(state, fwd_outs_per_mb[mb_index], mb_index),
+            )
+        return self._average_grads(grads, num_microbatches)
+
+
+class Schedule1F1B(PipelineScheduleBase):
+    """1F1B driver over two per-stage FX subgraphs (forward / backward).
+
+    Warmup runs ``min(num_microbatches, pp_degree - stage_idx)`` forwards
+    (one on the last stage), the steady state alternates one backward then
+    one forward per turn, and the cooldown drains the remaining backwards.
+    Running each backward as soon as its forward output is available shrinks
+    the pipeline bubble relative to GPipe's fill-drain order.
+
+    Requires ``num_microbatches >= pp_degree`` (checked at runtime), the same
+    constraint ``torch.distributed.pipelining.Schedule1F1B`` enforces.
+
+    Note:
+        Unlike GPipe, each microbatch's saved activations are freed as soon
+        as its backward consumes them. Its boundary sends share one key for
+        both directions and are released one turn after the backward posts —
+        the next turn's gradient receipt proves the previous microbatch's
+        transfers completed, so the wait cannot deadlock. Peak memory
+        therefore tracks the warmup depth (``pp_degree - stage_idx``) instead
+        of ``num_microbatches``; only the final microbatch's sends are still
+        waited at the end of the step. The last stage has no downstream
+        gradient to mark that progress, so its per-turn wait may briefly block
+        on the upstream peer.
+    """
+
+    def forward(self, *flat_inputs: Any) -> Tuple[torch.Tensor, ...]:
+        """Run one full 1F1B step (warmup -> steady 1B1F -> cooldown).
+
+        Args:
+            flat_inputs: ``(*state, *user_inputs)`` — the same surface
+                ``run_traced_graph`` feeds the compiled graph, with
+                ``user_inputs`` the flattened model inputs in trace order.
+
+        Returns:
+            ``(loss, *param_grads)``. On non-last stages the loss is a zero
+            scalar placeholder (the real loss lives on the last stage);
+            parameter gradients are the microbatch-averaged accumulation.
+
+        Raises:
+            ValueError: When ``num_microbatches < pp_degree`` (the schedule
+                cannot fill the pipeline).
+        """
+        state, user_inputs = self._split_inputs(flat_inputs)
+        num_microbatches, owned_inputs = self._resolve_microbatches(user_inputs)
+        if num_microbatches < self.pp_degree:
+            raise ValueError(
+                f"1F1B requires at least pp_degree={self.pp_degree} "
+                f"microbatches, got {num_microbatches} "
+                f"(batch {num_microbatches * self.microbatch_size} with "
+                f"pp_microbatch_size={self.microbatch_size}); lower "
+                f"pp_microbatch_size or use the gpipe schedule"
+            )
+
+        fwd_outs_per_mb: List[Any] = [None] * num_microbatches
+        grads: List[torch.Tensor] = []
+        fwd_index = 0
+        bwd_index = 0
+        # Forward output whose boundary activation has not shipped yet, with
+        # its microbatch index; the send is deferred one slot to keep the
+        # pair's FIFO complementary.
+        pending_index = -1
+        pending_out: Any = None
+        even = self.stage_idx % 2 == 0
+
+        # Warmup: fill the pipeline with ``pp_degree - stage_idx`` in-flight
+        # microbatches (one on the last stage) before the first backward.
+        # Even stages ship each activation right after its forward, except
+        # the last; odd stages ship the previous one just before the next
+        # forward. The parity stagger keeps neighbours complementary.
+        warmup = min(num_microbatches, self.pp_degree - self.stage_idx)
+        for k in range(warmup):
+            act_in = self._recv_activation()
+            if not even and k > 0:
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
+            out = self._apply_forward(state, act_in, owned_inputs, fwd_index)
+            fwd_outs_per_mb[fwd_index] = out
+            fwd_index += 1
+            if even:
+                if k != warmup - 1:
+                    self._send_forward(out, fwd_index - 1)
+                else:
+                    pending_index, pending_out = fwd_index - 1, out
+            else:
+                pending_index, pending_out = fwd_index - 1, out
+
+        # Steady turn: recv_grad (+ release the previous turn's boundary
+        # buffers), send_activation, backward, send_grad, recv_activation,
+        # forward.
+        for _ in range(num_microbatches - warmup):
+            grad_in = self._recv_gradient(fwd_outs_per_mb[bwd_index])
+            if bwd_index > 0:
+                # This gradient's arrival proves the peer consumed microbatch
+                # ``bwd_index - 1``'s boundary values on both directions, so
+                # its in-flight sends completed and their buffers can go.
+                self._wait_sends(bwd_index - 1)
+            if pending_out is not None:
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
+            grads = self._accumulate_grads(
+                grads,
+                self._apply_backward(
+                    state, grad_in, fwd_outs_per_mb[bwd_index], bwd_index
+                ),
+            )
+            # Backward was the last consumer of these outputs; keep only the
+            # last stage's loss scalar for _finalize_loss.
+            fwd_outs_per_mb[bwd_index] = (
+                fwd_outs_per_mb[bwd_index][:1] if self.is_last else None
+            )
+            bwd_index += 1
+            act_in = self._recv_activation()
+            out = self._apply_forward(state, act_in, owned_inputs, fwd_index)
+            fwd_outs_per_mb[fwd_index] = out
+            fwd_index += 1
+            pending_index, pending_out = fwd_index - 1, out
+        # Drop the frame-local reference to the final forward's outputs (the
+        # warmup's when the steady state never runs); it would otherwise pin
+        # them through the cooldown.
+        out = None
+
+        # Cooldown: drain the remaining backwards; the final forward's
+        # activation ships on the first turn.
+        for _ in range(warmup):
+            grad_in = self._recv_gradient(fwd_outs_per_mb[bwd_index])
+            if bwd_index > 0:
+                # Same release invariant as the steady state.
+                self._wait_sends(bwd_index - 1)
+            if pending_out is not None:
+                self._send_forward(pending_out, pending_index)
+                pending_out = None
+            grads = self._accumulate_grads(
+                grads,
+                self._apply_backward(
+                    state, grad_in, fwd_outs_per_mb[bwd_index], bwd_index
+                ),
+            )
+            # Backward was the last consumer of these outputs; keep only the
+            # last stage's loss scalar for _finalize_loss.
+            fwd_outs_per_mb[bwd_index] = (
+                fwd_outs_per_mb[bwd_index][:1] if self.is_last else None
+            )
+            bwd_index += 1
+
+        self._flush_pending_sends()
+
+        loss = self._finalize_loss(fwd_outs_per_mb, user_inputs)
+        return (loss, *self._average_grads(grads, num_microbatches))
+
+
+SCHEDULE_REGISTRY: Dict[str, Type[PipelineScheduleBase]] = {
+    "gpipe": ScheduleGPipe,
+    "1f1b": Schedule1F1B,
+}
+
+
+def get_schedule_class(name: str) -> Type[PipelineScheduleBase]:
+    """Resolve a ``PassConfig.pp_schedule`` name to its schedule class.
+
+    Args:
+        name: Schedule name, case-insensitive (``"gpipe"`` / ``"1f1b"``).
+
+    Returns:
+        The schedule class.
+
+    Raises:
+        ValueError: When ``name`` is not a registered schedule.
+    """
+    key = str(name).lower()
+    schedule_cls = SCHEDULE_REGISTRY.get(key)
+    if schedule_cls is None:
+        raise ValueError(
+            f"Unknown pp_schedule {name!r}; expected one of {sorted(SCHEDULE_REGISTRY)}"
+        )
+    return schedule_cls

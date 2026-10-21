@@ -40,7 +40,7 @@ import logging
 from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 
@@ -49,6 +49,35 @@ logger = logging.getLogger(__name__)
 # OrderedDict: arch_name → (module_path, class_name)
 # Lazy-loaded — only imported on first access.
 MODEL_ARCH_MAPPING = OrderedDict([])
+
+
+def register_custom_model(
+        architecture: str,
+        module_path: str,
+        class_name: str,
+) -> None:
+    """Register one lazily imported custom model implementation.
+
+    Args:
+        architecture: Exact value stored in ``config.architectures[0]``.
+        module_path: Importable module containing the model class.
+        class_name: Model class exported by ``module_path``.
+
+    Raises:
+        ValueError: If the architecture is empty or already has a different
+            registration.
+    """
+    if not all(isinstance(value, str) and value for value in (architecture, module_path, class_name)):
+        raise ValueError("custom model registration values must be non-empty strings")
+    entry = (module_path, class_name)
+    existing = MODEL_ARCH_MAPPING.get(architecture)
+    if existing is not None and tuple(existing[:2]) != entry:
+        raise ValueError(
+            f"conflicting custom model registration for {architecture!r}: "
+            f"{existing!r} vs {entry!r}"
+        )
+    MODEL_ARCH_MAPPING[architecture] = entry
+    _resolve_custom_model_cls.cache_clear()
 
 
 @lru_cache(maxsize=128)
@@ -89,6 +118,10 @@ _FAMILY_ALIASES: Dict[str, str] = {}
 _FAMILY_DIR_ALIASES = {
     "deepseekv2": "deepseek_v3",
     "qwen35text": "qwen3_5",
+    # Kimi-K2.6: the K2.6 checkpoint keeps the native Transformers
+    # ``model_type``/architecture spelling (kimi_k25) while the family is
+    # registered from ``models/kimi_k26/``.
+    "kimik25": "kimi_k26",
 }
 
 # normalized family directory name → registration module path; built lazily.
@@ -121,21 +154,27 @@ def _discover_family_providers() -> Dict[str, str]:
         providers = {}
         models_dir = Path(__file__).resolve().parent
         for child in sorted(models_dir.iterdir()):
-            if (
-                    child.is_dir()
-                    and child.name.isidentifier()
-                    and not child.name.startswith("_")
-                    and (child / "adapter" / "registration.py").is_file()
-            ):
-                providers[_normalize_family_key(child.name)] = (
-                    f"{__package__}.{child.name}.adapter.registration"
-                )
+            if not child.is_dir():
+                continue
+            if not child.name.isidentifier():
+                continue
+            if child.name.startswith("_"):
+                continue
+            if not (child / "adapter" / "registration.py").is_file():
+                continue
+            providers[_normalize_family_key(child.name)] = (
+                f"{__package__}.{child.name}.adapter.registration"
+            )
         _DISCOVERED_PROVIDERS = providers
     return _DISCOVERED_PROVIDERS
 
 
 def register_model_adapter(spec: ModelAdapterSpec) -> None:
-    """Register one family's adapter spec (idempotent; conflicts fail fast)."""
+    """Register one family's adapter spec (idempotent; conflicts fail fast).
+
+    Args:
+        spec: Model family provider declaration to register.
+    """
     existing = MODEL_ADAPTER_REGISTRY.get(spec.model_type)
     if existing is not None and existing != spec:
         raise ValueError(
@@ -156,6 +195,9 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
     Accepts any spelling — model_type (``deepseek_v3``), HF architecture
     (``DeepseekV3ForCausalLM``) or the canonical arch name used by the
     planner (``deepseekv3``).
+
+    Args:
+        model_type: Registered model family or architecture spelling.
     """
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:
@@ -178,3 +220,22 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
             if canonical is not None:
                 spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     return spec
+
+
+def resolve_model_adapter(model: Any) -> Optional[ModelAdapterSpec]:
+    """Resolve an adapter from a constructed model's configuration identity.
+
+    Args:
+        model: Model carrying a configuration with model type or architecture.
+
+    Returns:
+        Registered adapter, or ``None`` when the model has no provider.
+    """
+    config = getattr(model, "config", None)
+    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
+    for identity in identities:
+        if identity:
+            spec = get_model_adapter(identity)
+            if spec is not None:
+                return spec
+    return None

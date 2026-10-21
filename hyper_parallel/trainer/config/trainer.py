@@ -37,6 +37,7 @@ from hyper_parallel.trainer.config.parallelism import (
 from hyper_parallel.trainer.config.target import Target, _serialize_config_value
 from hyper_parallel.trainer.config.training import (
     DebugConfig,
+    ModelIntegrationConfig,
     ProfilingConfig,
     TrainingConfig,
     WandbConfig,
@@ -70,6 +71,9 @@ class TrainerConfig:
     activation_swap: Literal["none", "attention"] = "none"
     compile: CompileConfig = field(default_factory=CompileConfig)
 
+    # codegen
+    codegen: bool = False
+
     # data
     dataset: Optional[DatasetConfig] = None
     dataloader: Optional[DataLoaderConfig] = None
@@ -77,6 +81,7 @@ class TrainerConfig:
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    model_integration: ModelIntegrationConfig = field(default_factory=ModelIntegrationConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     magi: Optional[Any] = None
@@ -84,7 +89,11 @@ class TrainerConfig:
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
-        if self.compile.enabled and self.accelerator.pp_size > 1:
+        if (
+            self.compile.enabled
+            and not self.compile.selects_graph_compiler()
+            and self.accelerator.pp_size > 1
+        ):
             raise ValueError("compile is not supported together with pipeline parallelism")
         reduce_dtype = self.fsdp_config.mix_precision.reduce_dtype
         if self.optimizer.fp32_main_params and reduce_dtype != "float32":

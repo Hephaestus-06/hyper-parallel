@@ -15,7 +15,7 @@ sharding plan；训练侧使用可反向传播的 attention 路径，推理侧�
 执行边界在固定 Ascend recipe 下产生相同的 selected-token raw logprobs。
 
 检查仅覆盖更新前的 selected-token raw logprobs，不覆盖 Native-vLLM、其他模型、TP4/TP8、
-梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](hyper-rl-st.md)为准。
+梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](../README.md#系统测试)为准。
 
 ## Bit-Exact 定义
 
@@ -68,7 +68,7 @@ consistency:
 | 侧         | Profile 行为                                                                                  |
 | ---------- | --------------------------------------------------------------------------------------------- |
 | Trainer    | BF16 forward、FP32 reduce、packed THD、trainable FA2 varlen、batch-invariant ops、NPU RMSNorm |
-| Hyper-vLLM | Qwen3 Hyper adapter、FA3 KV-cache attention、batch-invariant、raw logprobs                    |
+| Hyper-vLLM | Qwen3 model adapter、FA3 KV-cache attention、batch-invariant、raw logprobs                    |
 | Scheduler  | 保留 Prefix Cache/Chunked Prefill，并恢复 discarded partial-prefill 的 RNG offset             |
 | 共同设置   | 相同 checkpoint/tokenizer、selected-token FP32 log-softmax 和 deterministic collectives       |
 
@@ -76,6 +76,23 @@ consistency:
 固定依赖与镜像下载见[运行镜像](../docker/README.md)。
 
 缺少依赖、版本不符、非 eager、非 Qwen3、非 Hyper-vLLM 或 TP degree 不匹配时 fail closed。
+
+### 0.23 概率归一化配方
+
+运行时自动选择固定版本配方；原有 0.22.1 / 0.22.1rc1 配方保持原合同。
+`qwen3_ascend_consistency_v023` 要求 vLLM 0.23.0、vLLM-Ascend 0.23.0.post1、
+Torch 2.10.0、torch-npu 2.10.0.post4、Transformers 5.5.4、
+flash-attn-npu 0.2.0b1 和 batch-invariant-ops 1.0.0；其他版本组合拒绝安装。
+
+0.23 配方让 Trainer 与 rollout 对原始二维 logits 使用显式 FP32 输出 log-softmax。
+Trainer 的非持久 RoPE 频率在 CPU 上重建后传到目标设备，与 Hyper-vLLM 的初始化保持相同；
+避免设备上的 FP32 幂运算微小差异在较大位置改变 BF16 cos/sin。
+此外，默认 `aten::sum` 重载桥接到批次无关轴归约，保留 mask 的整数类型和损失梯度。
+这些处理不会复制采样概率，也不会改变有效 token mask 或放宽 bit-exact 门禁。
+实际支持的拓扑和长度仍须由真实系统测试证明。
+
+Checkpoint 保存 `training_consistency_profile`，恢复时要求相同配方；不能直接将 off 配方的优化器状态
+载入一致性模型，因为两者的参数结构可能不同。
 
 ## 运行
 
@@ -119,6 +136,7 @@ export HYPER_QWEN3_ROLLOUT_DP=2
 ./hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_consistency_docker.sh disjoint
 ```
 
-正式配置见 [TP2 consistency YAML](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_tp2_consistency.yaml)。
+TP1/TP2 共用 [基础 YAML](../examples/gsm8k/configs/qwen3_4b_gsm8k_vllm_production.yaml)，
+上述一致性脚本根据 `HYPER_QWEN3_TP` 覆盖对应的拓扑、容量和预算，保留原 TP2 配方的行为。
 普通 Hyper/Native 或 TP degree mismatch 使用 `run_qwen3_tp_docker.sh`；该入口显式关闭 consistency，
 不能用于声明 bit-exact。

@@ -19,28 +19,28 @@ import os
 import random
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 
-from hyper_parallel import hsdp_sync_stream
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.trainer.runtime.distributed import (
-    create_distributed_setup_from_config,
-    initialize_distributed,
-)
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
+from rl.algorithm.distillation import compose_training_algorithm
 from rl.algorithm.loss import build_algorithm
+from rl.distillation.monitoring import validate_probability_gate
+from rl.distillation.config import parse_distillation_config
+from rl.distillation.teacher import TeacherManager, attach_teacher_scores
 from rl.checkpoint import RLCheckpointManager
 from rl.config import (
     build_model_registration,
     build_runtime_config,
     required_mapping,
+    resolve_router_replay_config,
     resolve_vllm_automatic_limits,
+    router_replay_mode,
     tokenizer_trust_remote_code,
     uses_colocated_vllm,
     validate_config,
@@ -54,7 +54,7 @@ from rl.consistency import (
     validate_consistency_forward_inputs,
     validate_pre_update_consistency,
 )
-from rl.dataset.batch_builder import ExperiencePreparer, get_bootstrap_values
+from rl.dataset.batch_builder import ExperiencePreparer, get_bootstrap_values, pad_agent_call_batch_for_dp
 from rl.dataset.contracts import ExperienceBatch
 from rl.dataset.data_source import (
     PromptDataset,
@@ -63,7 +63,10 @@ from rl.dataset.data_source import (
     collate_prompt_samples,
 )
 from rl.evaluation import Evaluator
-from rl.process_cleanup import cleanup_processes
+from rl.utils.process_cleanup import cleanup_processes
+from rl.reward_model import RewardModelClient, load_reward_function, score_model_batch, scorer_fingerprint
+from rl.roles.rollout.topology import resolve_vllm_rollout_topology
+from rl.weight_sync.sync import coordinator_call
 from rl.roles.model_setup import (
     build_role_model,
     build_role_optimizer,
@@ -71,13 +74,14 @@ from rl.roles.model_setup import (
 )
 from rl.roles.policy.actor import Actor
 from rl.roles.policy.critic import Critic
+from rl.roles.policy.router_adapter import install_router_replay
 from rl.roles.rollout.registry import build_rollout_engine
 from rl.roles.rollout.worker import (
     CodexRolloutManager,
     DeepSeekRolloutManager,
     RolloutManager,
 )
-from rl.roles.weight_sync.sync import PolicySnapshot
+from rl.weight_sync.sync import PolicySnapshot
 from rl.utils.monitoring.metrics import (
     build_training_metrics,
     enforce_learning_gate,
@@ -85,6 +89,14 @@ from rl.utils.monitoring.metrics import (
     summarize_training_diagnostics,
 )
 from rl.utils.monitoring.tracker import TrainingTracker
+
+from hyper_parallel import hsdp_sync_stream
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+from hyper_parallel.trainer.runtime.distributed import (
+    create_distributed_setup_from_config,
+    initialize_distributed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +166,40 @@ def _iter_state_tensors(value: Any):
             yield from _iter_state_tensors(item)
 
 
+def _validate_shared_vllm_metadata(
+    metadata: list[Any], deployment: str, world_size: int, expected_devices: int,
+) -> None:
+    """Require all trainer ranks to agree on one local vLLM endpoint and NPU set."""
+    for rank, rank_metadata in enumerate(metadata):
+        rank_local_world_size, _, _, rank_devices = rank_metadata
+        if int(rank_local_world_size) != world_size:
+            raise ValueError(
+                "The shared vLLM rollout path is single-node only: "
+                f"rank={rank}, world_size={world_size}, local_world_size={rank_local_world_size}"
+            )
+        device_ids = [device.strip() for device in rank_devices.split(",")]
+        if (
+            len(device_ids) != expected_devices
+            or not all(device_ids)
+            or len(set(device_ids)) != expected_devices
+        ):
+            raise ValueError(
+                f"Shared {deployment} rollout requires its full unique physical NPU set on every rank: "
+                f"rank={rank}, devices={rank_devices!r}, expected={expected_devices}"
+            )
+    endpoints = [(host, port) for _, host, port, _ in metadata]
+    if len(set(endpoints)) != 1:
+        raise ValueError(
+            f"Shared {deployment} rollout requires the same endpoint on every rank: endpoints={endpoints!r}"
+        )
+    device_mappings = [rank_devices for _, _, _, rank_devices in metadata]
+    if len(set(device_mappings)) != 1:
+        raise ValueError(
+            f"Shared {deployment} rollout requires the same full physical NPU set on every rank: "
+            f"mappings={device_mappings!r}"
+        )
+
+
 class SyncTrainer:
     """Synchronous RL orchestrator composed from HyperAutoModel role runtimes.
 
@@ -163,11 +209,13 @@ class SyncTrainer:
 
     def __init__(self, resolved_config: Mapping[str, Any]) -> None:
         """Validate configuration and build the complete distributed runtime."""
-        self.resolved_config = resolve_vllm_automatic_limits(resolved_config)
+        self.resolved_config = resolve_vllm_automatic_limits(resolve_router_replay_config(resolved_config))
         self._consistency_profile = configure_consistency_profile(self.resolved_config)
-        self.algorithm = build_algorithm(
-            required_mapping(self.resolved_config, "algorithm")
+        self.distillation_config = parse_distillation_config(self.resolved_config.get('distillation'))
+        self.algorithm = compose_training_algorithm(
+            build_algorithm(required_mapping(self.resolved_config, 'algorithm')), self.distillation_config,
         )
+        self.teacher_manager = None
         validate_config(self.resolved_config, self.algorithm)
         _configure_batch_invariant_communication(self.resolved_config)
         install_trainer_consistency_profile(self.resolved_config)
@@ -181,7 +229,9 @@ class SyncTrainer:
         self.runtime_config = build_runtime_config(self.resolved_config)
         self.state = RLTrainerState(max_steps=self.runtime_config.training.train_iters)
         self._runtime_started = False
+        self._rollout_closed_for_final_checkpoint = False
         self._tracker: Optional[TrainingTracker] = None
+        self._router_replay = None
         try:
             self._setup_runtime()
             self._validate_runtime_topology()
@@ -193,13 +243,24 @@ class SyncTrainer:
     def _cleanup(self) -> None:
         """Close owned services and reset lifecycle state even when cleanup raises."""
         try:
+            reward_model = getattr(self, "reward_model_client", None)
+            if reward_model is not None:
+                try:
+                    reward_model.close()
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    logger.warning("Reward model cleanup failed: %s", error)
             cleanup_processes(
                 self._tracker,
                 getattr(self, "rollout_manager", None),
-                getattr(self, "rollout_engine", None),
+                (None if getattr(self, "_rollout_closed_for_final_checkpoint", False)
+                 else getattr(self, "rollout_engine", None)),
                 self._runtime_started,
             )
         finally:
+            replay = getattr(self, "_router_replay", None)
+            if replay is not None:
+                replay.remove()
+                self._router_replay = None
             self._tracker = None
             self._runtime_started = False
 
@@ -210,9 +271,11 @@ class SyncTrainer:
         self.distributed_setup = create_distributed_setup_from_config(
             self.runtime_config
         )
-        # Pure TP still needs a size-one FSDP domain to retain checkpoint
-        # layouts and reduce TP-replicated gradients, as in the RL source tree.
-        if self.runtime_config.accelerator.tp_size > 1 and self.distributed_setup.strategy_config is None:
+        normalize_distributed_setup_overrides(self.distributed_setup, self.runtime_config)
+        # Size-one FSDP is also needed to honor requested CPU parameter/gradient offload.
+        needs_fsdp = (self.runtime_config.accelerator.tp_size > 1 or
+                      bool(getattr(self.runtime_config.fsdp_config, "enable_offload", False)))
+        if needs_fsdp and self.distributed_setup.strategy_config is None:
             self.distributed_setup.strategy_config = self.runtime_config.fsdp_config
         self.parallel_dims = self.distributed_setup.mesh_context
         self.mesh = self.parallel_dims.device_mesh
@@ -237,62 +300,59 @@ class SyncTrainer:
         """Run synchronous rollout, learning, publication, and checkpointing."""
         completed = False
         try:
-            self.checkpoints.validate_resume()
-            self.checkpoints.begin(self.state)
-            if self.state.global_step > self.rollout_engine.policy_version:
-                self._release_training_state_for_rollout()
-                self.rollout_engine.prepare_for_training()
-                self.rollout_engine.update_weights(
-                    PolicySnapshot(
-                        version=self.state.global_step,
-                        model_name=self.model_registration.name,
-                        payload=self.actor.actor_model,
-                    )
-                )
-                self._release_training_state_for_rollout()
-                self.rollout_engine.prepare_for_rollout()
-            else:
-                self._release_training_state_for_rollout()
-            if hasattr(self, "sampler"):
-                self.sampler.set_epoch(self.state.epoch)
-            data_iterator = iter(self.train_dataloader)
-            while self.state.global_step < self.state.max_steps:
-                batch, data_iterator = self._next_batch(data_iterator)
-                self._train_step(batch)
-            save_final = bool(
-                required_mapping(
-                    required_mapping(self.resolved_config, "train"),
-                    "checkpoint",
-                ).get("save_final", True)
-            )
-            if (
-                save_final
-                and self.evaluator is not None
-                and self.evaluator.last_step != self.state.global_step
-            ):
-                validation_metrics, validation_samples = self.evaluator.run(
-                    self.state.global_step
-                )
-                self._tracker.log(
-                    validation_metrics,
-                    step=self.state.global_step,
-                    sample_tables={"validation/samples": validation_samples},
-                )
-            if save_final and uses_colocated_vllm(self.resolved_config):
-                if self.rollout_engine.phase == "rollout":
-                    self.rollout_engine.prepare_for_training()
-                    self._release_training_state_for_rollout()
-                elif self.rollout_engine.phase != "training":
-                    raise RuntimeError(
-                        "Final checkpoint requires colocated vLLM in training residency, "
-                        f"got phase={self.rollout_engine.phase!r}"
-                    )
-            self.checkpoints.finalize(self.state)
-            completed = True
+            completed = self._train_and_checkpoint()
         finally:
             if completed:
                 dist.barrier()
             self._cleanup()
+
+    def _train_and_checkpoint(self) -> bool:
+        """Run training and final checkpointing, returning only after success."""
+        self.checkpoints.validate_resume()
+        self.checkpoints.begin(self.state)
+        if self.state.global_step > self.rollout_engine.policy_version:
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_training()
+            self.rollout_engine.update_weights(
+                PolicySnapshot(
+                    version=self.state.global_step,
+                    model_name=self.model_registration.name,
+                    payload=self.actor.actor_model,
+                )
+            )
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_rollout()
+        else:
+            self._release_training_state_for_rollout()
+        if hasattr(self, "sampler"):
+            self.sampler.set_epoch(self.state.epoch)
+        data_iterator = iter(self.train_dataloader)
+        while self.state.global_step < self.state.max_steps:
+            batch, data_iterator = self._next_batch(data_iterator)
+            self._train_step(batch)
+        save_final = bool(
+            required_mapping(
+                required_mapping(self.resolved_config, "train"),
+                "checkpoint",
+            ).get("save_final", True)
+        )
+        if (
+            save_final
+            and self.evaluator is not None
+            and self.evaluator.last_step != self.state.global_step
+        ):
+            validation_metrics, validation_samples = self.evaluator.run(
+                self.state.global_step
+            )
+            self._tracker.log(
+                validation_metrics,
+                step=self.state.global_step,
+                sample_tables={"validation/samples": validation_samples},
+            )
+        if save_final and uses_colocated_vllm(self.resolved_config):
+            self._close_rollout_for_final_checkpoint()
+        self.checkpoints.finalize(self.state)
+        return True
 
     def _prepare_experience(
         self,
@@ -311,7 +371,7 @@ class SyncTrainer:
                 group_size=self.parallel_dims.dp_size,
                 operation="pre-update",
             )
-        if collect_diagnostics or consistency_gate_enabled:
+        if collect_diagnostics or consistency_gate_enabled or getattr(self, "teacher_manager", None) is not None:
             stage_started = time.perf_counter()
             actor_log_probs = self._run_rank_synchronized(
                 "pre-update Actor log-probabilities",
@@ -352,13 +412,17 @@ class SyncTrainer:
             )
             values = full_values[:, :-1]
             timings["values"] = time.perf_counter() - stage_started
+        if getattr(self, 'teacher_manager', None) is not None:
+            if rollout.rollout_log_probs is None:
+                raise ValueError("OPD requires independently retained rollout_log_probs")
+            rollout = replace(rollout, old_log_probs=actor_log_probs.detach())
         stage_started = time.perf_counter()
-        experience = self.experience_preparer.prepare(
-            rollout,
-            reference_log_probs=reference_log_probs,
-            values=values,
-            bootstrap_values=bootstrap,
+        prepare = functools.partial(
+            self.experience_preparer.prepare, rollout,
+            reference_log_probs=reference_log_probs, values=values, bootstrap_values=bootstrap,
         )
+        experience = (self._run_rank_synchronized("GRPO target preparation", prepare)
+                      if self.algorithm.name == "grpo" else prepare())
         timings["adv"] = time.perf_counter() - stage_started
         diagnostic_metrics = (
             {}
@@ -370,6 +434,8 @@ class SyncTrainer:
 
     def _publish_policy(self, next_step: int) -> None:
         """Transfer the updated Actor and restore rollout residency."""
+        if getattr(self, "reward_model_client", None) is not None and self.reward_model_client.state != "sleeping":
+            raise RuntimeError("Reward model must be sleeping before Actor publication")
         hsdp_sync_stream()
         self._reshard_model(self.actor.actor_model)
         self._release_training_state_for_rollout()
@@ -408,10 +474,21 @@ class SyncTrainer:
         )
         timings["gen"] = time.perf_counter() - stage_started
         stage_started = time.perf_counter()
-        self.rollout_engine.prepare_for_training()
+        if getattr(self, "reward_model_client", None) is None:
+            self.rollout_engine.prepare_for_training()
+        else:
+            rollout = self._score_model_rollout(prompt_records, rollout)
+            timings["reward"] = float(rollout.metadata["reward_seconds"])
+            timings["reward_wake"] = float(rollout.metadata["reward_wake_seconds"])
+            timings["reward_sleep"] = float(rollout.metadata["reward_sleep_seconds"])
         timings["prepare_training"] = time.perf_counter() - stage_started
         if rollout.old_log_probs is None:
             raise RuntimeError("Training rollout did not produce old_log_probs")
+        rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
+        if getattr(self, 'teacher_manager', None) is not None:
+            stage_started = time.perf_counter()
+            rollout = self._score_teacher_rollout(prompt_records, rollout)
+            timings['teacher'] = time.perf_counter() - stage_started
         collect_diagnostics = next_step % self._log_steps == 0 or (
             self.evaluator is not None and self.checkpoints.will_save(next_step)
         )
@@ -420,27 +497,33 @@ class SyncTrainer:
             collect_diagnostics,
             timings,
         )
+        if getattr(self, "teacher_manager", None) is not None:
+            diagnostic_metrics.update(self._run_rank_synchronized(
+                "OPD pre-update probability gate",
+                lambda: validate_probability_gate(experience, self.distillation_config,
+                                                  group=self._dp_group_info.group,
+                                                  size=self.parallel_dims.dp_size),
+            ))
+        # Detached inference targets no longer need the full role parameters.
+        self._release_training_state_for_rollout()
         stage_started = time.perf_counter()
         actor_update = self.actor.update(experience)
         timings["update_actor"] = time.perf_counter() - stage_started
+        if getattr(self, 'teacher_manager', None) is not None:
+            diagnostic_metrics.update(self.actor.distillation_metrics())
+            counts = torch.tensor([
+                sum(key == teacher_key for key in experience.teacher_keys)
+                for teacher_key, _ in self.distillation_config.teachers
+            ], device=self.device, dtype=torch.int64)
+            if self.parallel_dims.dp_size > 1:
+                dist.all_reduce(counts, group=self._dp_group_info.group)
+            diagnostic_metrics.update({
+                f'distillation/teacher_samples/{key}': float(count)
+                for (key, _), count in zip(self.distillation_config.teachers, counts.tolist())
+            })
         if self._consistency_profile != CONSISTENCY_PROFILE_OFF:
             stage_started = time.perf_counter()
-            post_update_log_probs = self._run_rank_synchronized(
-                "post-update Actor log-probabilities",
-                lambda: self.actor.compute_log_probs(experience),
-            )
-            if post_update_log_probs is None:
-                raise RuntimeError(
-                    "Post-update Actor log-probability computation failed without a synchronized error"
-                )
-            diagnostic_metrics.update(
-                measure_post_update_old_policy_mismatch(
-                    experience,
-                    post_update_log_probs,
-                    group=self._dp_group_info.group,
-                    group_size=self.parallel_dims.dp_size,
-                )
-            )
+            diagnostic_metrics.update(self._post_update_mismatch(experience))
             timings["post_update_old_log_prob"] = time.perf_counter() - stage_started
         critic_update = None
         if self.critic is not None:
@@ -452,16 +535,7 @@ class SyncTrainer:
         timings["weight_sync"] = time.perf_counter() - stage_started
         timings["step"] = time.perf_counter() - step_started
         if collect_diagnostics:
-            diagnostic_metrics.update(
-                {f"timing_s/{name}": value for name, value in timings.items()}
-            )
-            diagnostic_metrics["perf/time_per_step"] = timings["step"]
-            total_tokens = diagnostic_metrics.get("training/total_tokens", 0.0)
-            diagnostic_metrics["perf/total_num_tokens"] = total_tokens
-            diagnostic_metrics["perf/tokens_per_second_per_device"] = total_tokens / max(
-                timings["step"] * dist.get_world_size(),
-                1.0e-9,
-            )
+            self._add_step_timing_metrics(diagnostic_metrics, timings)
         self._complete_step(
             step=next_step,
             batch=batch,
@@ -469,6 +543,51 @@ class SyncTrainer:
             actor_update=actor_update,
             critic_update=critic_update,
             diagnostic_metrics=diagnostic_metrics,
+        )
+
+    def _score_teacher_rollout(self, prompt_records: Any, rollout: ExperienceBatch) -> ExperienceBatch:
+        """Only TP owners score; synchronize errors before sharing results with siblings."""
+        owner = self.parallel_dims.tp_size == 1 or self.parallel_dims.tp_rank == 0
+        result = self._run_rank_synchronized(
+            'teacher scoring',
+            lambda: self.teacher_manager.score_batch(rollout, prompt_records) if owner else None,
+        )
+        if self.parallel_dims.tp_size > 1:
+            group = self.parallel_dims.device_mesh['tp'].get_group()
+            source = dist.get_global_rank(group, 0)
+            shared = [result]
+            dist.broadcast_object_list(shared, src=source, group=group)
+            result = shared[0]
+        if result is None:
+            raise RuntimeError('Teacher scoring completed without a result')
+        return self._run_rank_synchronized('teacher score alignment', lambda: attach_teacher_scores(rollout, result))
+
+    def _post_update_mismatch(self, experience: ExperienceBatch) -> dict[str, float]:
+        """Collect synchronized post-update policy consistency diagnostics."""
+        post_update_log_probs = self._run_rank_synchronized(
+            "post-update Actor log-probabilities",
+            lambda: self.actor.compute_log_probs(experience),
+        )
+        if post_update_log_probs is None:
+            raise RuntimeError(
+                "Post-update Actor log-probability computation failed without a synchronized error"
+            )
+        return measure_post_update_old_policy_mismatch(
+            experience,
+            post_update_log_probs,
+            group=self._dp_group_info.group,
+            group_size=self.parallel_dims.dp_size,
+        )
+
+    @staticmethod
+    def _add_step_timing_metrics(diagnostic_metrics: dict[str, float], timings: Mapping[str, float]) -> None:
+        """Record per-stage duration and per-device token throughput."""
+        diagnostic_metrics.update({f"timing_s/{name}": value for name, value in timings.items()})
+        diagnostic_metrics["perf/time_per_step"] = timings["step"]
+        total_tokens = diagnostic_metrics.get("training/total_tokens", 0.0)
+        diagnostic_metrics["perf/total_num_tokens"] = total_tokens
+        diagnostic_metrics["perf/tokens_per_second_per_device"] = total_tokens / max(
+            timings["step"] * dist.get_world_size(), 1.0e-9,
         )
 
     def _complete_step(
@@ -488,6 +607,7 @@ class SyncTrainer:
             batch,
             step=step,
             sample_limit=self._log_samples,
+            is_request_owner=bool(getattr(self.rollout_engine, "is_request_owner", True)),
         )
         metrics = build_training_metrics(
             step=step,
@@ -519,8 +639,11 @@ class SyncTrainer:
                 sample_tables={"validation/samples": validation_samples},
             )
         if checkpoint_will_save and uses_colocated_vllm(self.resolved_config):
-            self.rollout_engine.prepare_for_training()
-            self._release_training_state_for_rollout()
+            if step == self.state.max_steps:
+                self._close_rollout_for_final_checkpoint()
+            else:
+                self.rollout_engine.prepare_for_training()
+                self._release_training_state_for_rollout()
         self.checkpoints.complete_step(
             self.state,
             loss=actor_update.total_loss,
@@ -533,6 +656,14 @@ class SyncTrainer:
         ):
             self._release_training_state_for_rollout()
             self.rollout_engine.prepare_for_rollout()
+
+    def _close_rollout_for_final_checkpoint(self) -> None:
+        """Release inference processes and IPC consumers before the final save."""
+        if getattr(self, "_rollout_closed_for_final_checkpoint", False):
+            return
+        self.rollout_engine.close()
+        self._rollout_closed_for_final_checkpoint = True
+        self._release_training_state_for_rollout()
 
     def _validate_runtime_topology(self) -> None:
         """Validate torchrun world size against the resolved Trainer mesh."""
@@ -575,40 +706,20 @@ class SyncTrainer:
             else int(vllm_config["data_parallel_size"])
             * int(vllm_config["tensor_parallel_size"])
         )
-        for rank, rank_metadata in enumerate(metadata):
-            rank_local_world_size, _, _, rank_devices = rank_metadata
-            if int(rank_local_world_size) != world_size:
-                raise ValueError(
-                    "The shared vLLM rollout path is single-node only: "
-                    f"rank={rank}, world_size={world_size}, local_world_size={rank_local_world_size}"
-                )
-            device_ids = [device.strip() for device in rank_devices.split(",")]
-            if (
-                len(device_ids) != expected_devices
-                or not all(device_ids)
-                or len(set(device_ids)) != expected_devices
-            ):
-                raise ValueError(
-                    f"Shared {deployment} rollout requires its full unique physical NPU set on every rank: "
-                    f"rank={rank}, devices={rank_devices!r}, expected={expected_devices}"
-                )
-        endpoints = [(host, port) for _, host, port, _ in metadata]
-        if len(set(endpoints)) != 1:
-            raise ValueError(
-                f"Shared {deployment} rollout requires the same endpoint on every rank: endpoints={endpoints!r}"
-            )
-        device_mappings = [rank_devices for _, _, _, rank_devices in metadata]
-        if len(set(device_mappings)) != 1:
-            raise ValueError(
-                f"Shared {deployment} rollout requires the same full physical NPU set on every rank: "
-                f"mappings={device_mappings!r}"
-            )
+        _validate_shared_vllm_metadata(metadata, deployment, world_size, expected_devices)
 
     def _build_runtime(self) -> None:
         """Build tokenizer, data, requirement-selected roles, optimizers, and tracking."""
         self._build_tokenizer_and_data()
         self._build_models_and_optimizers()
         self._build_rollout_runtime()
+        self._build_reward_model_runtime()
+        if self.distillation_config.enabled:
+            self.teacher_manager = TeacherManager(self.distillation_config)
+            self._run_rank_synchronized(
+                'teacher startup validation',
+                lambda: self.teacher_manager.validate(self.model_registration.tokenizer_path),
+            )
         self.experience_preparer = ExperiencePreparer(self.algorithm, self._dp_group_info)
         checkpoint_config = required_mapping(
             required_mapping(self.resolved_config, "train"),
@@ -638,6 +749,9 @@ class SyncTrainer:
             raise ValueError("Tokenizer must define eos_token_id for response truncation")
         self.tokenizer.padding_side = "left"
         dataset_kwargs = {
+            "row_adapter": data_config.get("row_adapter"),
+            "metadata_columns": data_config.get("metadata_columns"),
+            "chat_template_kwargs": data_config.get("chat_template_kwargs"),
             "tokenizer": self.tokenizer,
             "max_prompt_length": int(data_config["max_prompt_length"]),
             "prompt_column": (
@@ -700,6 +814,7 @@ class SyncTrainer:
             self.runtime_config,
             self.distributed_setup,
             frozen=False,
+            cpu_threads=train_config.get("model_init_cpu_threads"),
         )
         reference_model = None
         if self.algorithm.requirements.roles.reference:
@@ -707,6 +822,7 @@ class SyncTrainer:
                 self.runtime_config,
                 self.distributed_setup,
                 frozen=True,
+                cpu_threads=train_config.get("model_init_cpu_threads"),
             )
         critic_model = None
         critic_config = train_config.get("critic", {})
@@ -714,6 +830,7 @@ class SyncTrainer:
             critic_runtime = build_runtime_config(self.resolved_config, critic=True)
             critic_model = build_role_model(
                 critic_runtime, self.distributed_setup, frozen=False,
+                cpu_threads=train_config.get("model_init_cpu_threads"),
             )
         actor_optimizer, actor_lr_scheduler = build_role_optimizer(
             self.runtime_config,
@@ -727,6 +844,10 @@ class SyncTrainer:
             "algorithm": self.algorithm,
             "micro_batch_size": int(train_config["micro_batch_size"]),
         }
+        replay_kwargs = {}
+        if router_replay_mode(self.resolved_config) == "R3":
+            self._router_replay = install_router_replay(actor_model)
+            replay_kwargs["router_replay"] = self._router_replay
         self.actor = Actor(
             actor_model=actor_model,
             optimizer=actor_optimizer,
@@ -737,7 +858,9 @@ class SyncTrainer:
             response_mini_batch_size=int(train_config["response_mini_batch_size"]),
             update_epochs=int(train_config["policy_update_epochs"]),
             max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
+            distillation=self.distillation_config if self.distillation_config.enabled else None,
             **actor_kwargs,
+            **replay_kwargs,
         )
         self.reference_actor = (
             None
@@ -809,23 +932,30 @@ class SyncTrainer:
         )
         self._configure_rollout_tensor_parallel()
         eos_token_ids = _resolve_eos_token_ids(self.model, self.tokenizer)
+        runner_name = str(agentic_config.get("runner", "internal"))
         manager_kwargs = {
-            "engine": self.rollout_engine,
-            "tokenizer": self.tokenizer,
-            "environment_name": str(agentic_config["environment"]),
-            "max_turns": int(agentic_config["max_turns"]),
-            "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
-            "max_episode_tokens": (
-                None
-                if agentic_config.get("max_episode_tokens") is None
-                else int(agentic_config["max_episode_tokens"])
-            ),
-            "environment_settings": dict(agentic_config),
-            "interaction_mode": agentic_config.get("interaction_mode"),
             "pad_token_id": int(self.tokenizer.pad_token_id),
             "eos_token_id": eos_token_ids[0],
-            "eos_token_ids": eos_token_ids,
         }
+        if runner_name == "internal":
+            manager_kwargs.update({
+                "engine": self.rollout_engine,
+                "tokenizer": self.tokenizer,
+                "environment_name": str(agentic_config["environment"]),
+                "max_turns": int(agentic_config["max_turns"]),
+                "max_observation_tokens": int(agentic_config["max_observation_tokens"]),
+                "max_episode_tokens": (
+                    None
+                    if agentic_config.get("max_episode_tokens") is None
+                    else int(agentic_config["max_episode_tokens"])
+                ),
+                "environment_settings": {
+                    **agentic_config,
+                    **({"defer_reward_model": True} if "reward_model" in self.resolved_config else {}),
+                },
+                "interaction_mode": agentic_config.get("interaction_mode"),
+                "eos_token_ids": eos_token_ids,
+            })
         generation_kwargs = {
             "num_return_sequences": int(rollout_config["num_return_sequences"]),
             "max_new_tokens": int(rollout_config["max_new_tokens"]),
@@ -837,7 +967,8 @@ class SyncTrainer:
             "ignore_eos": bool(rollout_config.get("ignore_eos", False)),
             "do_sample": True,
         }
-        runner_name = str(agentic_config.get("runner", "internal"))
+        if router_replay_mode(self.resolved_config) == "R3":
+            generation_kwargs["collect_router_trace"] = True
         self.codex_runtime: Optional[CodexRuntime] = None
         self.deepseek_runtime: Optional[DeepSeekRuntime] = None
         if runner_name == "codex":
@@ -881,7 +1012,76 @@ class SyncTrainer:
                 max_samples=None if max_samples is None else int(max_samples),
                 log_samples=int(evaluation_config.get("log_samples", 0)),
                 progress_steps=int(evaluation_config.get("progress_steps", 0)),
+                data_parallel_rank=int(self.parallel_dims.dp_rank),
+                data_parallel_size=int(self.parallel_dims.dp_size),
+                is_request_owner=int(self.parallel_dims.tp_rank) == 0,
+                score_batch=(functools.partial(self._score_model_rollout, evaluation=True)
+                             if "reward_model" in self.resolved_config else None),
             )
+
+    def _build_reward_model_runtime(self) -> None:
+        """Create an idle colocated RM handle only for explicit model scoring."""
+        self.reward_model_client = None
+        reward_config = self.resolved_config.get("reward_model")
+        if reward_config is None:
+            return
+        self.reward_model_config = dict(reward_config)
+        self.reward_model_scorer = load_reward_function(reward_config["scorer"])
+        self.reward_model_scorer_id = scorer_fingerprint(reward_config)
+        rollout_config = required_mapping(required_mapping(self.resolved_config, "rollout"), "vllm")
+        devices = resolve_vllm_rollout_topology(rollout_config, os.environ).visible_devices
+        self.reward_model_client = RewardModelClient(
+            reward_config, devices, owner=dist.get_rank() == 0,
+        )
+
+    def _score_model_rollout(
+        self, prompts: Any, rollout: ExperienceBatch, *, evaluation: bool = False,
+    ) -> ExperienceBatch:
+        """Switch shared NPU residency, invoke the task scorer, and restore rollout for evaluation."""
+        client = self.reward_model_client
+        if client is None:
+            raise RuntimeError("Model reward scoring requires a configured RM")
+        started = time.perf_counter()
+        self.rollout_engine.prepare_for_training()
+        self._release_training_state_for_rollout()
+        wake_started = time.perf_counter()
+        state = coordinator_call("reward model wake", client.prepare)
+        client.state = state
+        wake_seconds = time.perf_counter() - wake_started
+        primary_error = None
+        try:
+            scored = score_model_batch(
+                prompts, rollout, scorer=self.reward_model_scorer, client=client,
+                scorer_id=self.reward_model_scorer_id,
+                tp_rank=int(self.parallel_dims.tp_rank), tp_size=int(self.parallel_dims.tp_size),
+                tp_group=(self.parallel_dims.device_mesh["tp"].get_group()
+                          if self.parallel_dims.tp_size > 1 else None),
+                max_concurrency=int(self.reward_model_config.get("max_concurrency", 16)),
+            )
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                sleep_started = time.perf_counter()
+                state = coordinator_call("reward model sleep", client.sleep)
+                client.state = state
+                sleep_seconds = time.perf_counter() - sleep_started
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Keep the original scoring failure while logging any cleanup failure.
+                if primary_error is None:
+                    raise
+                logger.exception("RM sleep failed while handling the original scoring error")
+        if client.state != "sleeping":
+            raise RuntimeError("Reward model must sleep before training continues")
+        scored.metadata.update({
+            "reward_seconds": time.perf_counter() - started,
+            "reward_wake_seconds": wake_seconds,
+            "reward_sleep_seconds": sleep_seconds,
+        })
+        if evaluation:
+            self.rollout_engine.prepare_for_rollout()
+        return scored
 
     def _build_tracker(self) -> None:
         """Initialize console/W&B tracking on global rank zero only."""
@@ -917,10 +1117,13 @@ class SyncTrainer:
 
     @staticmethod
     def _reshard_model(model: Optional[Any]) -> None:
-        """Explicitly release every nested full FSDP parameter allocation."""
+        """Initialize loaded shards and release nested full FSDP parameter allocations."""
         if model is None:
             return
         for hsdp_root in iter_hsdp_roots(model):
+            # Meta builds defer CPU offload initialization until the first forward,
+            # while colocated rollout can allocate its weights before that forward.
+            hsdp_root.hsdp_scheduler.hsdp_state.lazy_init()
             hsdp_root.reshard()
 
     @staticmethod
@@ -929,13 +1132,13 @@ class SyncTrainer:
         if optimizer is None:
             return
         optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
-        device_states = [
-            str(tensor.device)
-            for component in optimizers
-            for state in component.state.values()
-            for tensor in _iter_state_tensors(state)
-            if not str(tensor.device).startswith("cpu")
-        ]
+        device_states = []
+        for component in optimizers:
+            for state in component.state.values():
+                for tensor in _iter_state_tensors(state):
+                    device = str(tensor.device)
+                    if not device.startswith("cpu"):
+                        device_states.append(device)
         if device_states:
             raise RuntimeError(
                 f"Colocated {role} optimizer state must be CPU resident, got devices={sorted(set(device_states))}"

@@ -25,13 +25,14 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Union
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import torch
 import torch.distributed as dist
 
+from rl.dataset.contracts import RouterTrace, resize_router_trace
 from rl.roles.model_setup import (
     ModelRegistration,
     VLLMModelRegistration,
@@ -39,11 +40,17 @@ from rl.roles.model_setup import (
 )
 from rl.roles.rollout.base import GenerationRequest, GenerationResult
 from rl.roles.rollout.registry import ROLLOUT_ENGINES
+from rl.roles.rollout.router_capture import (
+    RouterCaptureSpec,
+    decode_router_trace,
+    router_trace_from_wire,
+    router_trace_to_wire,
+)
 from rl.roles.rollout.topology import (
     VLLMRolloutTopology,
     resolve_vllm_rollout_topology,
 )
-from rl.roles.weight_sync import (
+from rl.weight_sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
     VLLMWeightSyncClientMixin,
@@ -52,7 +59,7 @@ from rl.roles.weight_sync import (
     synchronize_error,
     synchronized_call,
 )
-from rl.roles.weight_sync.config import resolve_weight_sync_config
+from rl.weight_sync.config import resolve_weight_sync_config
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -78,6 +85,8 @@ _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
 )
 _VLLM_SAMPLING_EPS = 1e-5
 _VLLM_CHILD_CAPACITY_OVERSUBSCRIPTION = 2
+_CompletionRecord = Union[tuple[list[int], Optional[list[float]], Optional[str]],
+                          tuple[list[int], Optional[list[float]], Optional[str], RouterTrace]]
 
 
 def _load_aiohttp() -> Any:
@@ -112,12 +121,14 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         base_url: str,
         model_name: str,
         request_timeout: float,
+        router_capture_spec: Optional[RouterCaptureSpec] = None,
     ) -> None:
         """Bind a persistent HTTP client and optional owned process to one endpoint."""
         self._process = process
         self._base_url = base_url.rstrip("/")
         self._model_name = model_name
         self._request_timeout = request_timeout
+        self._router_capture_spec = router_capture_spec
         self._async_runtime_lock = threading.Lock()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._async_thread: Optional[threading.Thread] = None
@@ -365,21 +376,9 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
             payload["seed"] = seed
         return payload
 
-    def _completion_records_from_response(
-        self,
-        prompts: list[list[int]],
-        num_choices: int,
-        settings: Any,
-        result: Mapping[str, Any],
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
-        """Validate one OpenAI response and restore its prompt-major child order."""
-        choices = result.get("choices")
-        expected_choices = len(prompts) * num_choices
-        if not isinstance(choices, list) or len(choices) != expected_choices:
-            raise RuntimeError(
-                "vLLM completion response count mismatch: "
-                f"expected={expected_choices}, received={len(choices) if isinstance(choices, list) else None}"
-            )
+    @staticmethod
+    def _validate_choice_indices(choices: list[Any], expected_choices: int) -> None:
+        """Require unique prompt-major indices before restoring response order."""
         indices = []
         for choice in choices:
             if not isinstance(choice, Mapping):
@@ -393,31 +392,68 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 "vLLM completion response choice indices must be a unique contiguous range: "
                 f"expected=0..{expected_choices - 1}, received={indices}"
             )
+
+    def _completion_records_from_response(
+        self,
+        prompts: list[list[int]],
+        num_choices: int,
+        settings: Any,
+        result: Mapping[str, Any],
+    ) -> list[_CompletionRecord]:
+        """Validate one OpenAI response and restore its prompt-major child order."""
+        choices = result.get("choices")
+        expected_choices = len(prompts) * num_choices
+        if not isinstance(choices, list) or len(choices) != expected_choices:
+            raise RuntimeError(
+                "vLLM completion response count mismatch: "
+                f"expected={expected_choices}, received={len(choices) if isinstance(choices, list) else None}"
+            )
+        self._validate_choice_indices(choices, expected_choices)
         records = []
         for choice in sorted(choices, key=lambda item: item["index"]):
-            token_ids = choice.get("token_ids")
-            if not isinstance(token_ids, list):
-                raise RuntimeError("vLLM completion response did not include token_ids")
-            token_log_probs = None
-            if settings.collect_log_probs:
-                log_probs = choice.get("logprobs")
-                if not isinstance(log_probs, dict) or not isinstance(log_probs.get("token_logprobs"), list):
-                    raise RuntimeError("vLLM completion response did not include token_logprobs")
-                raw_log_probs = log_probs["token_logprobs"]
-                if len(raw_log_probs) != len(token_ids) or any(value is None for value in raw_log_probs):
-                    raise RuntimeError(
-                        "vLLM completion returned incomplete sampled-token log probabilities: "
-                        f"tokens={len(token_ids)}, log_probs={len(raw_log_probs)}"
-                    )
-                token_log_probs = [float(value) for value in raw_log_probs]
-            records.append(([int(token_id) for token_id in token_ids], token_log_probs))
+            record = self._completion_record(choice, settings.collect_log_probs)
+            if getattr(settings, "collect_router_trace", False):
+                if self._router_capture_spec is None:
+                    raise ValueError("R3 capture requires checkpoint router metadata")
+                if len(record[0]) > settings.max_new_tokens:
+                    raise ValueError("R3 completion exceeds the requested maximum token count")
+                prompt = prompts[choice["index"] // num_choices]
+                trace = decode_router_trace(choice.get("routed_experts"), len(prompt) + len(record[0]),
+                                            self._router_capture_spec)
+                record = (*record, trace)
+            records.append(record)
         return records
+
+    @staticmethod
+    def _completion_record(
+        choice: Mapping[str, Any], collect_log_probs: bool,
+    ) -> tuple[list[int], Optional[list[float]], Optional[str]]:
+        """Keep one completion's sampled tokens, raw probabilities and stop reason aligned."""
+        token_ids = choice.get("token_ids")
+        if not isinstance(token_ids, list):
+            raise RuntimeError("vLLM completion response did not include token_ids")
+        token_log_probs = None
+        if collect_log_probs:
+            log_probs = choice.get("logprobs")
+            if not isinstance(log_probs, dict) or not isinstance(log_probs.get("token_logprobs"), list):
+                raise RuntimeError("vLLM completion response did not include token_logprobs")
+            raw_log_probs = log_probs["token_logprobs"]
+            if len(raw_log_probs) != len(token_ids) or any(value is None for value in raw_log_probs):
+                raise RuntimeError(
+                    "vLLM completion returned incomplete sampled-token log probabilities: "
+                    f"tokens={len(token_ids)}, log_probs={len(raw_log_probs)}"
+                )
+            token_log_probs = [float(value) for value in raw_log_probs]
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise RuntimeError("vLLM completion finish_reason must be a string when provided")
+        return [int(token_id) for token_id in token_ids], token_log_probs, finish_reason
 
     async def _generate_completion_request(
         self,
         request: _CompletionRequest,
         settings: Any,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[_CompletionRecord]:
         """Execute one admitted completion parent through the persistent pool."""
         payload = self._completion_payload(
             request.prompts,
@@ -501,9 +537,9 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         row_count: int,
         settings: Any,
         child_capacity: int,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[_CompletionRecord]:
         """Run a child-bounded rolling pool and restore stable output row order."""
-        results: list[Optional[tuple[list[int], Optional[list[float]]]]] = [None] * row_count
+        results: list[Optional[_CompletionRecord]] = [None] * row_count
         pending = deque(requests)
         active: dict[asyncio.Task, _CompletionRequest] = {}
         inflight_children = 0
@@ -545,16 +581,23 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 except Exception:
                     await _cancel_active_completions(active)
                     raise
-                if len(records) != request.child_count:
-                    raise RuntimeError(
-                        "vLLM admitted parent returned an unexpected child count: "
-                        f"expected={request.child_count}, received={len(records)}"
-                    )
-                for offset, record in enumerate(records):
-                    results[request.start_row + offset] = record
+                self._store_completion_records(results, request, records)
         if any(record is None for record in results):
             raise RuntimeError("vLLM async admission completed with missing output rows")
         return [record for record in results if record is not None]
+
+    @staticmethod
+    def _store_completion_records(
+        results: list[Any], request: _CompletionRequest, records: list[Any],
+    ) -> None:
+        """Validate child count and restore this request to its original rows."""
+        if len(records) != request.child_count:
+            raise RuntimeError(
+                "vLLM admitted parent returned an unexpected child count: "
+                f"expected={request.child_count}, received={len(records)}"
+            )
+        for offset, record in enumerate(records):
+            results[request.start_row + offset] = record
 
     def generate_tokens(
         self,
@@ -563,7 +606,7 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         child_capacity: int,
         batch_invariant: bool = False,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[_CompletionRecord]:
         """Generate ordered records through persistent child-bounded HTTP admission."""
         if child_capacity <= 0:
             raise ValueError(f"vLLM child_capacity must be positive, got {child_capacity}")
@@ -602,36 +645,33 @@ class _VLLMHTTPClient(VLLMWeightSyncClientMixin):
         try:
             os.killpg(process_group_id, signal.SIGTERM)
         except ProcessLookupError as error:
+            self._process = None
             if runtime_error is not None:
                 raise runtime_error from error
             return
-        if not parent_running:
-            # The process-group leader can exit before its EngineCore descendants.
+        if parent_running:
             try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self._wait_process_group_exit(process_group_id)
-            if runtime_error is not None:
-                raise runtime_error
-            return
+                self._process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._kill_process_group(process_group_id)
+                self._process.wait(timeout=10)
+        # The API leader may exit before its children finish unlinking IPC resources.
         try:
-            self._process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self._process.wait(timeout=10)
-        else:
-            # The API server leader may exit before EngineCore descendants.
-            try:
-                os.killpg(process_group_id, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        self._wait_process_group_exit(process_group_id)
+            self._wait_process_group_exit(process_group_id, timeout=5)
+        except RuntimeError:
+            self._kill_process_group(process_group_id)
+            self._wait_process_group_exit(process_group_id)
+        self._process = None
         if runtime_error is not None:
             raise runtime_error
+
+    @staticmethod
+    def _kill_process_group(process_group_id: int) -> None:
+        """Escalate shutdown only for descendants that ignored graceful termination."""
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     @staticmethod
     def _has_live_process_group_members(process_group_id: int) -> bool:
@@ -700,6 +740,10 @@ class VLLMGenerationEngine:
             self._config.get("model_implementation", "native"),
         )
         self._client = client
+        self._router_capture_spec = (
+            RouterCaptureSpec.from_checkpoint(model.weights_path)
+            if self._config.get("enable_return_routed_experts", False) else None
+        )
         self._resolved_topology: Optional[VLLMRolloutTopology] = None
         self._trainer_tp_group: Optional[Any] = None
         self._trainer_tp_rank = 0
@@ -712,7 +756,13 @@ class VLLMGenerationEngine:
             self._deployment,
             self._ensure_client,
             publisher,
+            sleep_level=self._config.get("sleep_level", 1),
         )
+
+    @property
+    def router_capture_spec(self) -> Optional[RouterCaptureSpec]:
+        """Expose immutable checkpoint metadata for external completion capture."""
+        return self._router_capture_spec
 
     def configure_trainer_tensor_parallel(
         self,
@@ -844,7 +894,7 @@ class VLLMGenerationEngine:
             "--weight-transfer-config",
             json.dumps({"backend": weight_transfer_backend}),
         ]
-        if self._rollout_model.is_hyper:
+        if self._rollout_model.is_adapted:
             command.extend(
                 (
                     "--hf-overrides",
@@ -855,22 +905,25 @@ class VLLMGenerationEngine:
                     ),
                 )
             )
-        if bool(self._config.get("trust_remote_code", True)):
-            command.append("--trust-remote-code")
-        if bool(self._config.get("enforce_eager", True)):
-            command.append("--enforce-eager")
+        if self._rollout_model.family == "qwen3_5":
+            command.append("--language-model-only")
+        for key, default in (
+            ("trust_remote_code", True),
+            ("enable_expert_parallel", False),
+            ("enforce_eager", True),
+            ("enable_prompt_tokens_details", False),
+            ("skip_mm_profiling", False),
+            ("enable_auto_tool_choice", False),
+            ("enable_return_routed_experts", False),
+        ):
+            if bool(self._config.get(key, default)):
+                command.append(f"--{key.replace('_', '-')}")
         for key, option in (
             ("enable_prefix_caching", "--enable-prefix-caching"),
             ("enable_chunked_prefill", "--enable-chunked-prefill"),
         ):
             if key in self._config:
                 command.append(option if bool(self._config[key]) else f"--no-{option[2:]}")
-        if bool(self._config.get("enable_prompt_tokens_details", False)):
-            command.append("--enable-prompt-tokens-details")
-        if bool(self._config.get("skip_mm_profiling", False)):
-            command.append("--skip-mm-profiling")
-        if bool(self._config.get("enable_auto_tool_choice", False)):
-            command.append("--enable-auto-tool-choice")
         for key, option in (
             ("tool_call_parser", "--tool-call-parser"),
             ("reasoning_parser", "--reasoning-parser"),
@@ -900,6 +953,8 @@ class VLLMGenerationEngine:
         profiler_config = self._config.get("profiler_config")
         if profiler_config is not None:
             command.extend(("--profiler-config", json.dumps(profiler_config)))
+        if self._config.get("compilation_config") is not None:
+            command.extend(("--compilation-config", json.dumps(self._config["compilation_config"])))
         return command
 
     def _server_environment(self, visible_devices: str) -> dict[str, str]:
@@ -959,6 +1014,7 @@ class VLLMGenerationEngine:
             f"http://{host}:{port}",
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
+            router_capture_spec=self._router_capture_spec,
         )
         try:
             client.wait_ready(float(self._config.get("startup_timeout", 300)))
@@ -974,6 +1030,7 @@ class VLLMGenerationEngine:
             f"http://{host}:{port}",
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
+            router_capture_spec=self._router_capture_spec,
         )
 
     def _ensure_client(self) -> Any:
@@ -1039,7 +1096,7 @@ class VLLMGenerationEngine:
         prompt_token_ids: list[list[int]],
         settings: Any,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[_CompletionRecord]:
         """Generate through an injected in-process vLLM test client."""
         try:
             from vllm import SamplingParams, TokensPrompt  # pylint: disable=C0415
@@ -1076,15 +1133,29 @@ class VLLMGenerationEngine:
         )
         prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_token_ids]
         outputs = client.generate(prompts, sampling_params=sampling, use_tqdm=False)
+        records = self._inprocess_records(outputs, settings.collect_log_probs)
+        if getattr(settings, "collect_router_trace", False):
+            if self._router_capture_spec is None:
+                raise ValueError("R3 capture requires checkpoint router metadata")
+            records = [(*record, decode_router_trace(
+                getattr(output.outputs[0], "routed_experts", None), len(prompt) + len(record[0]),
+                self._router_capture_spec,
+            )) for record, output, prompt in zip(records, outputs, prompt_token_ids)]
+        return records
+
+    def _inprocess_records(
+        self, outputs: Any, collect_log_probs: bool,
+    ) -> list[_CompletionRecord]:
+        """Read generated token IDs and optional sampled log-probabilities."""
         records = []
         for request_output in outputs:
             completion = request_output.outputs[0]
             token_log_probs = (
                 self._sampled_log_probs(completion)
-                if settings.collect_log_probs
+                if collect_log_probs
                 else None
             )
-            records.append((list(completion.token_ids), token_log_probs))
+            records.append((list(completion.token_ids), token_log_probs, getattr(completion, "finish_reason", None)))
         return records
 
     def _completion_records(
@@ -1093,7 +1164,7 @@ class VLLMGenerationEngine:
         prompt_token_ids: list[list[int]],
         settings: Any,
         row_seeds: Optional[tuple[int, ...]] = None,
-    ) -> list[tuple[list[int], Optional[list[float]]]]:
+    ) -> list[_CompletionRecord]:
         """Generate completions through HTTP or an injected local client."""
         if isinstance(client, _VLLMHTTPClient):
             return client.generate_tokens(
@@ -1144,7 +1215,7 @@ class VLLMGenerationEngine:
     @staticmethod
     def _build_generation_result(
         request: GenerationRequest,
-        completion_records: list[tuple[list[int], Optional[list[float]]]],
+        completion_records: list[_CompletionRecord],
         elapsed: float,
         worker_policy_version: Optional[int],
     ) -> GenerationResult:
@@ -1163,8 +1234,19 @@ class VLLMGenerationEngine:
                 response_ids.shape,
                 dtype=torch.float32,
             )
-        for row, (completion_token_ids, completion_log_probs) in enumerate(completion_records):
+        router_traces = [] if settings.collect_router_trace else None
+        if len(completion_records) != request.input_ids.shape[0]:
+            raise ValueError("vLLM completion records must align with generation request rows")
+        for row, record in enumerate(completion_records):
+            completion_token_ids, completion_log_probs, _ = record[:3]
             tokens = completion_token_ids[: settings.max_new_tokens]
+            if router_traces is not None:
+                if len(record) != 4 or record[3] is None:
+                    raise ValueError("vLLM did not return required router trace")
+                prompt_count = int(request.attention_mask[row].sum().item())
+                if record[3].expert_ids.shape[0] != prompt_count + len(completion_token_ids):
+                    raise ValueError("vLLM router trace must align with unpadded prompt and completion")
+                router_traces.append(resize_router_trace(record[3], prompt_count + len(tokens)))
             if tokens:
                 response_ids[row, : len(tokens)] = response_ids.new_tensor(tokens)
                 response_mask[row, : len(tokens)] = True
@@ -1179,6 +1261,8 @@ class VLLMGenerationEngine:
             generation_seconds=elapsed,
             response_mask=response_mask,
             worker_policy_version=worker_policy_version,
+            finish_reasons=tuple(record[2] for record in completion_records),
+            router_traces=None if router_traces is None else tuple(router_traces),
         )
 
     def _generate_request(
@@ -1271,6 +1355,10 @@ class VLLMGenerationEngine:
             response_mask = result.response_mask
             rollout_log_probs = result.rollout_log_probs
             generation_seconds = result.generation_seconds
+            finish_reasons = result.finish_reasons
+            router_wire = (None if result.router_traces is None else tuple(
+                None if trace is None else router_trace_to_wire(trace) for trace in result.router_traces
+            ))
         else:
             sequences = request.input_ids.new_empty(sequence_shape)
             response_mask = request.attention_mask.new_empty(
@@ -1286,6 +1374,8 @@ class VLLMGenerationEngine:
                 else None
             )
             generation_seconds = None
+            finish_reasons = None
+            router_wire = None
         if response_mask is None:
             raise RuntimeError("Trainer TP rollout result requires response_mask")
         dist.broadcast(
@@ -1306,23 +1396,40 @@ class VLLMGenerationEngine:
                 group=self._trainer_tp_group,
                 group_src=0,
             )
-        elapsed: list[Any] = [None] * self._trainer_tp_size
-        dist.all_gather_object(
-            elapsed,
-            generation_seconds if self.is_request_owner else None,
-            self._trainer_tp_group,
+        metadata = self._gather_tp_metadata(
+            {"generation_seconds": generation_seconds, "finish_reasons": finish_reasons,
+             "router_traces": router_wire}
+            if self.is_request_owner else None,
         )
+        router_traces = None
+        if request.settings.collect_router_trace:
+            wire_rows = metadata.get("router_traces")
+            if not isinstance(wire_rows, tuple) or len(wire_rows) != response_shape[0] or any(
+                trace is None for trace in wire_rows
+            ):
+                raise ValueError("Trainer TP rollout result requires router traces for every row")
+            router_traces = (result.router_traces if self.is_request_owner else tuple(
+                router_trace_from_wire(trace) for trace in wire_rows
+            ))
+        return GenerationResult(
+            sequences=sequences,
+            rollout_log_probs=rollout_log_probs,
+            generation_seconds=float(metadata["generation_seconds"]),
+            response_mask=response_mask,
+            worker_policy_version=worker_version,
+            finish_reasons=metadata["finish_reasons"],
+            router_traces=router_traces,
+        )
+
+    def _gather_tp_metadata(self, metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Collect rollout metadata only from the TP request owner."""
+        elapsed: list[Any] = [None] * self._trainer_tp_size
+        dist.all_gather_object(elapsed, metadata, self._trainer_tp_group)
         if elapsed[0] is None or any(value is not None for value in elapsed[1:]):
             raise RuntimeError(
                 f"Trainer TP rollout timing ownership is invalid: {elapsed}"
             )
-        return GenerationResult(
-            sequences=sequences,
-            rollout_log_probs=rollout_log_probs,
-            generation_seconds=float(elapsed[0]),
-            response_mask=response_mask,
-            worker_policy_version=worker_version,
-        )
+        return elapsed[0]
 
     def _generate_tp_owned(self, request: GenerationRequest) -> GenerationResult:
         """Generate once per logical DP coordinate and replicate within TP."""
@@ -1363,7 +1470,8 @@ class VLLMGenerationEngine:
             raise RuntimeError("vLLM generation failed without a synchronized error")
         return result
 
-    def synchronize_error(self, local_error: Optional[Exception], operation: str) -> None:
+    @staticmethod
+    def synchronize_error(local_error: Optional[Exception], operation: str) -> None:
         """Propagate rollout and postprocessing failures across training ranks."""
         synchronize_error(local_error, operation)
 

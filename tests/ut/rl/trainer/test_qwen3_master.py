@@ -39,19 +39,16 @@ from rl.roles.model_setup import ModelRegistration, resolve_vllm_model
 from rl.roles.qwen3_builder import Qwen3ShardingPlanner as ShardingPlanner
 from rl.roles.qwen3_builder import get_module_replacements, get_parallel_overrides
 from rl.roles.qwen3_builder import restore_tied_parameter as _replicate_tied_weights
-from rl.roles.weight_sync import packed_weight
-from rl.roles.weight_sync.layout import (
-    build_direct_reshard_plan,
-    pack_direct_bucket,
-    resolve_destination_layouts,
-    resolve_source_layouts,
-)
-from rl.roles.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
-from rl.roles.weight_sync.packed_weight import (
+from rl.weight_sync import packed_weight
+from rl.weight_sync.layout import resolve_destination_layouts, resolve_source_layouts
+from rl.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
+from rl.weight_sync.packed_weight import (
     build_packed_weight_buckets,
+    pack_direct_bucket,
     materialize_packed_weight_bucket,
     unpack_packed_weights,
 )
+from rl.weight_sync.transfer import DirectReshardStrategy
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
@@ -180,7 +177,7 @@ def test_full_gather_restores_every_hf_weight(monkeypatch):
     state = adapter.map_local_state_dict(replaced.state_dict())
     actual = {}
     for bucket in build_packed_weight_buckets(state, 256):
-        packed = materialize_packed_weight_bucket(state, bucket)
+        packed = materialize_packed_weight_bucket(state, bucket, device=torch.device("cpu"))
         actual.update(unpack_packed_weights(packed, adapter.packed_metadata(bucket.worker_metadata())))
     expected.pop("lm_head.weight")
     assert actual.keys() == expected.keys()
@@ -189,8 +186,8 @@ def test_full_gather_restores_every_hf_weight(monkeypatch):
 
 @pytest.mark.parametrize("trainer_tp,dp_shards", [(1, 1), (1, 3), (2, 1), (2, 3)])
 @pytest.mark.parametrize("rollout_tp", [1, 2])
-@pytest.mark.parametrize("is_hyper", [True, False])
-def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, dp_shards, rollout_tp, is_hyper):
+@pytest.mark.parametrize("is_adapted", [True, False])
+def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, dp_shards, rollout_tp, is_adapted):
     """Copy actual fused shards through the production direct bucket packer."""
 
     config = tiny_config()
@@ -261,7 +258,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
                 local = full.chunk(rollout_tp, dim=axis)[tp_rank]
             placements[name] = (placement,)
             expected_map[name] = local
-        if not is_hyper:
+        if not is_adapted:
             for layer in range(config.num_hidden_layers):
                 prefix = f"model.layers.{layer}."
                 qkv = [expected_map.pop(prefix + "self_attn." + projection + ".weight")
@@ -277,7 +274,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
         worker_descriptions.append({
             "tp_rank": tp_rank, "tp_size": rollout_tp,
             "tensors": rollout_tensor_descriptions(
-                worker_model, config, is_hyper=is_hyper, tp_rank=tp_rank, tp_size=rollout_tp,
+                worker_model, config, is_adapted=is_adapted, tp_rank=tp_rank, tp_size=rollout_tp,
             ),
         })
         destination_maps.append(parameters)
@@ -286,7 +283,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
     destinations = resolve_destination_layouts(
         worker_descriptions, {name: tuple(value.shape) for name, value in expected.items()},
     )
-    plan = build_direct_reshard_plan(
+    plan = DirectReshardStrategy.build_direct_reshard_plan(
         sources, destinations, source_world_size=len(states), bucket_size_bytes=128,
     )
     _assert_direct_bucket_copy(plan, states, destination_maps, expected_maps)

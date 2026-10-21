@@ -50,6 +50,7 @@ using ::hyper_parallel::multicore::shmem::DeviceModel;
 using runtime::AllocationRecord;
 using runtime::AllocationSpec;
 using runtime::AllocationView;
+using runtime::Config;
 using runtime::DataEngine;
 using runtime::DfxOperation;
 using runtime::DfxPhase;
@@ -112,11 +113,7 @@ std::string_view ToString(DeviceModel model) {
 }
 
 std::string_view ToString(DataEngine engine) {
-  switch (engine) {
-    case DataEngine::Mte:
-      return "mte";
-  }
-  return "Unknown";
+  return engine == DataEngine::Mte ? "mte" : "Unknown";
 }
 
 std::string_view ToString(DfxOperation operation) {
@@ -405,14 +402,23 @@ AllocationView TensorView(const at::Tensor &tensor) {
                         static_cast<int32_t>(tensor.device().index())};
 }
 
-void Initialize(int32_t root_rank, int32_t root_size) {
+py::bytes GetUniqueId() {
+  return py::bytes(UnwrapOperation(cann::host::get_unique_id(), "GetUniqueId"));
+}
+
+void Initialize(int32_t root_rank, int32_t root_size, const py::bytes &unique_id, uint64_t heap_size_bytes) {
   const auto config = runtime::LoadConfigFromEnvironment();
   if (!config.ok()) {
     ThrowStatus(config.error(), DfxOperation::Initialize, DfxPhase::Validation);
   }
-  RequireOk(Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, config.value(),
-                                           config.value().bootstrap_endpoint_base),
-            DfxOperation::Initialize);
+  auto effective_config = config.value();
+  if (heap_size_bytes != 0) {
+    effective_config.heap_size_bytes = heap_size_bytes;
+  }
+  RequireOk(
+    Runtime::Instance().Initialize(RootWorldInfo{root_rank, root_size}, effective_config,
+                                   effective_config.bootstrap_endpoint_base, static_cast<std::string>(unique_id)),
+    DfxOperation::Initialize);
 }
 
 at::Tensor Empty(const std::vector<int64_t> &shape, c10::ScalarType dtype, const std::optional<int64_t> &alignment) {
@@ -726,6 +732,38 @@ py::dict FailureDict(const runtime::DfxFailure &failure) {
   return result;
 }
 
+template <typename T>
+py::object OptionalValue(const std::optional<T> &value) {
+  return value.has_value() ? py::cast(*value) : py::none();
+}
+
+py::object ConfigObject(const std::optional<Config> &config) {
+  if (!config.has_value()) {
+    return py::none();
+  }
+  py::dict result;
+  result["heap_size_bytes"] = config->heap_size_bytes;
+  result["timeout_seconds"] = config->timeout_seconds;
+  result["data_engine"] = ToString(config->data_engine);
+  result["bootstrap_endpoint_base"] = config->bootstrap_endpoint_base;
+  return std::move(result);
+}
+
+py::object AllocationRecordsObject(const std::optional<std::vector<AllocationRecord>> &records) {
+  if (!records.has_value()) {
+    return py::none();
+  }
+  py::list result;
+  for (const AllocationRecord &record : *records) {
+    py::dict entry;
+    entry["allocation_id"] = py::cast(record.allocation_id);
+    entry["allocation_base"] = py::cast(record.allocation_base);
+    entry["allocation_bytes"] = py::cast(record.allocation_bytes);
+    result.append(std::move(entry));
+  }
+  return std::move(result);
+}
+
 py::dict DebugState() {
   const DfxSnapshot snapshot = Runtime::Instance().DebugState();
   py::dict result;
@@ -737,52 +775,15 @@ py::dict DebugState() {
   result["device_model"] =
     snapshot.device_identity.has_value() ? py::cast(ToString(snapshot.device_identity->model)) : py::none();
   result["soc_name"] = snapshot.device_identity.has_value() ? py::cast(snapshot.device_identity->soc_name) : py::none();
-  if (snapshot.config.has_value()) {
-    py::dict config;
-    config["heap_size_bytes"] = snapshot.config->heap_size_bytes;
-    config["timeout_seconds"] = snapshot.config->timeout_seconds;
-    config["data_engine"] = ToString(snapshot.config->data_engine);
-    config["bootstrap_endpoint_base"] = snapshot.config->bootstrap_endpoint_base;
-    result["config"] = std::move(config);
-  } else {
-    result["config"] = py::none();
-  }
-  result["allocated_count"] =
-    snapshot.allocated_count.has_value() ? py::cast(*snapshot.allocated_count) : py::none();
-  result["allocated_bytes"] =
-    snapshot.allocated_bytes.has_value() ? py::cast(*snapshot.allocated_bytes) : py::none();
+  result["config"] = ConfigObject(snapshot.config);
+  result["allocated_count"] = OptionalValue(snapshot.allocated_count);
+  result["allocated_bytes"] = OptionalValue(snapshot.allocated_bytes);
   result["remaining_bytes"] = snapshot.config.has_value() && snapshot.allocated_bytes.has_value()
                                 ? py::cast(snapshot.config->heap_size_bytes - *snapshot.allocated_bytes)
                                 : py::none();
-  result["max_allocated_bytes"] = snapshot.max_allocated_bytes.has_value()
-                                    ? py::cast(*snapshot.max_allocated_bytes)
-                                    : py::none();
-  if (snapshot.active_allocations.has_value()) {
-    py::list allocations;
-    for (const AllocationRecord &record : *snapshot.active_allocations) {
-      py::dict entry;
-      entry["allocation_id"] = py::cast(record.allocation_id);
-      entry["allocation_base"] = py::cast(record.allocation_base);
-      entry["allocation_bytes"] = py::cast(record.allocation_bytes);
-      allocations.append(std::move(entry));
-    }
-    result["active_allocations"] = std::move(allocations);
-  } else {
-    result["active_allocations"] = py::none();
-  }
-  if (snapshot.leaked_allocations.has_value()) {
-    py::list leaks;
-    for (const AllocationRecord &record : *snapshot.leaked_allocations) {
-      py::dict entry;
-      entry["allocation_id"] = py::cast(record.allocation_id);
-      entry["allocation_base"] = py::cast(record.allocation_base);
-      entry["allocation_bytes"] = py::cast(record.allocation_bytes);
-      leaks.append(std::move(entry));
-    }
-    result["leaked_allocations"] = std::move(leaks);
-  } else {
-    result["leaked_allocations"] = py::none();
-  }
+  result["max_allocated_bytes"] = OptionalValue(snapshot.max_allocated_bytes);
+  result["active_allocations"] = AllocationRecordsObject(snapshot.active_allocations);
+  result["leaked_allocations"] = AllocationRecordsObject(snapshot.leaked_allocations);
   result["latest_failure"] =
     snapshot.latest_failure.has_value() ? py::object(FailureDict(*snapshot.latest_failure)) : py::none();
   return result;
@@ -795,7 +796,9 @@ PYBIND11_MODULE(hyper_parallel_shmem_torch, module) {
   namespace bindings = hyper_parallel::multicore::shmem::bindings;
 
   module.doc() = "Private Torch binding for the Hyper-Parallel SHMEM Runtime";
-  module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"));
+  module.def("_get_unique_id", &bindings::GetUniqueId);
+  module.def("_initialize", &bindings::Initialize, py::arg("root_rank"), py::arg("root_size"),
+             py::arg("unique_id") = py::bytes(), py::arg("heap_size_bytes") = 0);
   module.def("_empty", &bindings::Empty, py::arg("shape"), py::arg("dtype"), py::arg("alignment") = std::nullopt);
   module.def("_free", &bindings::Free, py::arg("tensor"));
   module.def("_barrier", &bindings::Barrier, py::kw_only(), py::arg("blocking") = true);

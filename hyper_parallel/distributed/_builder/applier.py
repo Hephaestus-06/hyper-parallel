@@ -43,7 +43,7 @@ from hyper_parallel.distributed._builder.parameter_sharding import (
     _resolve_module,
 )
 from hyper_parallel.distributed._builder.planner import (
-    ShardingPlanner,
+    _get_architecture,
 )
 from hyper_parallel.distributed._builder.precompiled_boundary import (
     PrecompiledBoundary,
@@ -70,13 +70,12 @@ logger = logging.getLogger(__name__)
 # ────────────────────────────────────────────────────────────────────────────
 
 def _validate_inner_wrapper_injections(plan, cp_mesh, transformers_version):
+    """Validate the structural contract of every inner wrapper."""
     # Lazy import: wrappers imports forward_rewriter at module level;
     # keeping it lazy decouples the applier's import graph.
     from hyper_parallel.distributed.context_parallel.wrappers import (  # pylint: disable=C0415
-        INNER_WRAPPER_REGISTRY,
         INNER_WRAPPER_REQUIREMENTS,
     )
-    """Validate the structural contract of every inner wrapper."""
     for fqn, spec in plan.modules.items():
         wrapper = getattr(spec, "inner_wrapper", None)
         target = getattr(spec, "inner_target", None)
@@ -173,12 +172,14 @@ def _validate_ep_compute_injections(plan, model):
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
-        if (spec.is_boundary and getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
+        if not spec.is_boundary:
+            continue
+        if (getattr(spec, "_ep_size", 0)  # pylint: disable=protected-access
                 and getattr(spec, "local_compute_fn", None) is None
                 and getattr(spec, "region_dispatch", None) is not False):
             suggestion = ""
             if model is not None:
-                arch = ShardingPlanner._get_architecture(model)
+                arch = _get_architecture(model)
                 archetype = EP_ARCHETYPE_SUGGESTIONS.get(arch)
                 if archetype is not None:
                     suggestion = (
@@ -190,14 +191,14 @@ def _validate_ep_compute_injections(plan, model):
                         "module's actual submodule names).\n"
                     )
             raise ValueError(
-                f"ep_size={spec._ep_size} is active (expert parameters "  # pylint: disable=protected-access
-                f"will be sharded as {{EP: Shard(0)}}), but boundary "
+                f"ep_size={spec._ep_size} is active (parameters explicitly "  # pylint: disable=protected-access
+                f"declared with EP sharding use the virtual-EP source mesh), but boundary "
                 f"{fqn!r} has no local-region compute source — nothing "
-                "executes the expert compute and all-to-all, and the "
+                "executes the corresponding local compute and all-to-all, and the "
                 "framework no longer injects any implementation "
                 "automatically. Choose one of:\n"
                 f"{suggestion}"
-                "  ① Pick a built-in archetype factory per the model's "
+                "  ① Routed MoE: pick a built-in archetype factory per the model's "
                 "behavior (full semantics: router / shared expert / gate / "
                 "merge all implemented cohesively; see the recipes.py "
                 "module docstring for the available archetypes and the "
@@ -211,11 +212,11 @@ def _validate_ep_compute_injections(plan, model):
                 "           _target_: hyper_parallel.distributed.expert_parallel."
                 "recipes.qwen2moe_ep_compute_fn   # pick per the "
                 "archetype table\n"
-                "  ② Atypical MoE → write your own factory following "
-                "examples/distributed/ep_factories.py (use require_attrs "
-                "for the same build-time interface validation)\n"
-                "  ③ In-house EP-aware MoE (all-to-all already inside "
-                "forward) → declare region_dispatch: false")
+                "  ② Model-specific MoE or another EP-sharded module (for "
+                "example a sparse table): provide a local_compute_fn from "
+                "models/<family>/adapter and validate its interface at build time\n"
+                "  ③ A module whose forward already owns all-to-all: declare "
+                "region_dispatch: false")
 
 
 def _preflight_compute_injection(plan, mesh, model=None):
@@ -238,10 +239,12 @@ def _log_injection_choice(module_fqn, spec):
     has_wrap = getattr(spec, "inner_wrapper", None) is not None
     if not (has_fn or has_wrap or rd is not None):
         return   # ordinary boundary: no injection, axiomatic default dispatch-through — do not spam the log
-    what = "+".join(
-        [x for x, ok in (("local_compute_fn", has_fn),
-                         ("inner_wrapper", has_wrap)) if ok]
-    ) or "the module's own forward (no fn injected, region_dispatch=False declared)"
+    candidates = (("local_compute_fn", has_fn), ("inner_wrapper", has_wrap))
+    enabled = []
+    for name, is_enabled in candidates:
+        if is_enabled:
+            enabled.append(name)
+    what = "+".join(enabled) or "the module's own forward (no fn injected, region_dispatch=False declared)"
     if rd is True:
         effect = ("validate dispatch-through true validation enabled "
                   "(in-region strategy propagation + true out_src "
@@ -286,6 +289,52 @@ def _get_active_mesh(mesh, mesh_dim_names):
     if mesh_dim_names and names and all(n in names for n in mesh_dim_names):
         return mesh[tuple(mesh_dim_names)]
     return mesh
+
+
+def _get_active_mesh_with_names(mesh, mesh_dim_names):
+    """Return ``(active_sub_mesh, active_dim_names)`` sliced in mesh-major order.
+
+    A variant of :func:`_get_active_mesh` for callers whose axis names may
+    arrive in an order that differs from the mesh's declared order (the
+    codegen runtime's frozen plans record axes in offline-mesh order while a
+    live ``DeviceMesh`` declares e.g. ``("dp", "cp", "tp")``).
+    ``DeviceMesh.__getitem__`` only accepts a slice whose axis indices are
+    ascending, so the names are reordered into the mesh's own declared order
+    before slicing, and the reordered tuple is returned alongside the mesh:
+    the caller must resolve placements against the *returned* names, because
+    the sliced sub-mesh carries exactly that axis order.
+
+    A mesh without the given axes (e.g. an ``OfflineMesh`` built without
+    ``ep``) returns itself with the intersecting names; a mesh that HAS the
+    axes but cannot be sliced raises — never silently returns the unsliced
+    mesh (that would shard along a wrong axis).
+    """
+    if not mesh_dim_names:
+        return mesh, ()
+    names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+    if not names:
+        return mesh, tuple(mesh_dim_names)
+    # Mesh-major order: keep only the axes the plan shards on, reordered to
+    # the mesh's own declared order (so `mesh[tuple(...)]` indices ascend).
+    active = tuple(n for n in names if n in mesh_dim_names)
+    if not active:
+        return mesh, ()
+    # Only skip slicing when the mesh declares EXACTLY the plan's axes (in the
+    # same order).  Comparing against ``names`` (not the filtered ``active``)
+    # prevents a mesh that also carries non-plan axes -- e.g. a ('dp', 'tp')
+    # mesh vs a ('tp',) frozen plan -- from returning the unsliced 2-D mesh
+    # alongside a 1-D placement axis.  When the mesh carries any extra axis the
+    # plan does not shard on, it must be sliced down to ``active`` so the dense
+    # mesh dimension count always matches the placement tuple.
+    if tuple(names) == tuple(mesh_dim_names):
+        return mesh, tuple(mesh_dim_names)
+    # The plan may name an axis the mesh does not carry (e.g. a plan frozen for
+    # an ``ep`` axis on a mesh that derives EP from the dense region).  Never
+    # silently return the unsliced mesh with a dim name that does not exist on
+    # it — that would resolve placements against a phantom axis and corrupt
+    # every downstream DTensor layout.  Slice to the overlapping active axes
+    # and keep the same mesh-major names.
+    return mesh[active], active
 
 
 def _get_tp_submesh(mesh, mesh_dim_names):
@@ -372,6 +421,18 @@ def build_expert_mesh(mesh: DeviceMesh, ep_size: int) -> DeviceMesh:
 # Phase C: forward wrapping driving loop (05 §4.4)
 # ────────────────────────────────────────────────────────────────────────────
 
+def _boundary_post_order_key(item):
+    """Sort key for boundary installation: deepest FQN first (post-order).
+
+    D-14 invariant 2 (05 §13.3): boundaries are wrapped in post-order — an
+    outer boundary's local_compute_fn may cache inner forwards, and the
+    unpack-scope exclusion (invariant 3) requires inner wrappers to be
+    installed first.  Shared with the codegen runtime's install loop so both
+    paths keep a single ordering contract.
+    """
+    return -item[0].count(".")
+
+
 def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
 
@@ -389,7 +450,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         else create_tp_collective_lowerer(mesh, mesh_dim_names)
     )
     for module_fqn, spec in sorted(
-            plan.modules.items(), key=lambda kv: -kv[0].count(".")):
+            plan.modules.items(), key=_boundary_post_order_key):
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
@@ -399,7 +460,6 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
             mesh_dim_names,
             op_lowerer=boundary_op_lowerer,
         )
-        keep_output_dtensor = _keep_loss_parallel_output(plan, spec)
         _bind_input_indices(boundary, module)
         # Injection discipline: a declared injection requires an explicit
         # region_dispatch; declaring True without any injection is redundant
@@ -478,7 +538,7 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 boundary,
                 spec,
                 mesh_dim_names,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )
         else:
             # D-02: production vocab-parallel embedding masked wrapper
@@ -488,5 +548,5 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
                 module,
                 boundary,
                 spec,
-                keep_output_dtensor=keep_output_dtensor,
+                keep_output_dtensor=_keep_loss_parallel_output(plan, spec),
             )

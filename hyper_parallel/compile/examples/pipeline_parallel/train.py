@@ -35,7 +35,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Iterator, Tuple
+from typing import Dict, Iterator
 
 import torch
 import torch.distributed as dist
@@ -48,10 +48,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
 
 from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
+    GraphParallelPlan,
     GraphTrainer,
     PassConfig,
-    PassPlan,
-    create_pass_plan_from_yaml,
+    create_plan_from_yaml,
 )
 
 _LOG = logging.getLogger(__name__)
@@ -121,7 +121,7 @@ class PPDemoModel(nn.Module):
 
 
 def train_fn(
-    model: nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
+    model: nn.Module, *, input_ids: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
     """Next-token loss; computed at the root, so it lands on the LAST stage."""
     logits = model(input_ids)
@@ -143,16 +143,17 @@ def build_pass_config(config: dict) -> PassConfig:
         pp_enabled=parallel.get("pp_enabled", True),
         pp_degree=parallel.get("pp_degree"),
         pp_microbatch_size=parallel.get("pp_microbatch_size", 1),
+        pp_schedule=parallel.get("pp_schedule", "gpipe"),
     )
 
 
-def build_pass_plan(config_path: str) -> PassPlan:
+def build_parallel_plan(config_path: str) -> GraphParallelPlan:
     """Parse the YAML plan (fsdp + pp sections; extra keys are ignored).
 
     With ``pp.stages`` declared the plan is manual; without it ``PpPass``
     falls back to the automatic even-by-layers split.
     """
-    return create_pass_plan_from_yaml(config_path=config_path)
+    return create_plan_from_yaml(config_path=config_path)
 
 
 def main() -> None:  # pylint: disable=too-many-locals
@@ -174,14 +175,15 @@ def main() -> None:  # pylint: disable=too-many-locals
     ).to(device)
 
     pass_config = build_pass_config(config)
-    pass_plan = build_pass_plan(args.config)
+    parallel_plan = build_parallel_plan(args.config)
 
     if rank == 0:
-        stages = pass_plan.pp_module_fqns_per_stage or "auto (even by layers)"
+        stages = parallel_plan.pp_module_fqns_per_stage or "auto (even by layers)"
         _LOG.info("=" * 72)
         _LOG.info(
-            "PP demo: world_size=%s (stages), microbatch=%s",
+            "PP demo: world_size=%s (stages), schedule=%s, microbatch=%s",
             world_size,
+            pass_config.pp_schedule,
             pass_config.pp_microbatch_size,
         )
         _LOG.info("Stage plan: %s", stages)
@@ -191,7 +193,7 @@ def main() -> None:  # pylint: disable=too-many-locals
         model=model,
         train_fn=train_fn,
         pass_config=pass_config,
-        pass_plan=pass_plan,
+        parallel_plan=parallel_plan,
         optimizer_config={
             "lr": config["train"]["optimizer"]["lr"],
             "grad_clip": config["train"].get("grad_clip"),
@@ -214,15 +216,15 @@ def main() -> None:  # pylint: disable=too-many-locals
     # every full batch it receives into matching microbatches at runtime.
     # ``compile`` does NOT move its sample tensors, so place them on the
     # trainer's device here (``train_step`` does the same per batch).
-    input_batch, label_batch = trainer._place_on_device(  # pylint: disable=protected-access
-        (batch[:microbatch], labels[:microbatch])
+    inputs = trainer._place_on_device(  # pylint: disable=protected-access
+        {"input_ids": batch[:microbatch], "labels": labels[:microbatch]}
     )
-    trainer.compile(input_batch, label_batch)
+    trainer.compile(**inputs)
 
-    def data_iter() -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def data_iter() -> Iterator[Dict[str, torch.Tensor]]:
         """Yield the same synthetic batch each step (demo workload)."""
         for _ in range(steps):
-            yield batch, labels
+            yield {"input_ids": batch, "labels": labels}
 
     losses = trainer.train(
         data_iter(), max_steps=steps, log_interval=config["logging"]["log_interval"]

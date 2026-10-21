@@ -13,13 +13,17 @@
  * @brief Reusable per-core cycle interval recorder for TaskDesc-based megakernels.
  */
 
-#ifndef MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H
-#define MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H
+#ifndef HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_CYCLE_TRACE_RECORDER_H_
+#define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_CYCLE_TRACE_RECORDER_H_
 
-#include "kernel_operator.h"
-#include "runtime_config.hpp"
+#include "kernel_operator.h"   // NOLINT(build/include_subdir): public AscendC SDK header.
+#include "runtime_config.hpp"  // NOLINT(build/include_subdir): adjacent assembled runtime header.
 
 using namespace AscendC;  // NOLINT(build/namespaces)
+
+namespace MulticoreRuntime {
+
+constexpr uint32_t CYCLE_TRACE_RESERVED_WORDS = 9;
 
 struct CycleTraceCoreHeader {
   uint64_t entryCycle;
@@ -28,7 +32,7 @@ struct CycleTraceCoreHeader {
   uint32_t coreType;
   uint32_t blockId;
   uint32_t recordCapacity;
-  uint32_t reserved[9];
+  uint32_t reserved[CYCLE_TRACE_RESERVED_WORDS];
 };
 
 struct CycleTraceRecord {
@@ -45,18 +49,20 @@ static_assert(sizeof(CycleTraceRecord) == 32, "Unexpected cycle trace record siz
 
 class CycleTraceRecorder {
  public:
-  static constexpr uint32_t MAX_RECORDS_PER_CORE = 256;
+  static constexpr uint32_t MAX_RECORDS_PER_CORE =
+    ((0xFFFFFFFFU - sizeof(CycleTraceCoreHeader)) / sizeof(CycleTraceRecord) / 16) * 16;
 
   __aicore__ inline void Init(uint32_t worker_id, GM_ADDR profile_buffer, uint32_t aic_record_capacity,
-                             uint32_t aiv_record_capacity) {
-    aic_record_capacity =
-      aic_record_capacity > MAX_RECORDS_PER_CORE ? MAX_RECORDS_PER_CORE : aic_record_capacity;
-    aiv_record_capacity =
-      aiv_record_capacity > MAX_RECORDS_PER_CORE ? MAX_RECORDS_PER_CORE : aiv_record_capacity;
-    uint32_t aic_stride_bytes =
-      sizeof(CycleTraceCoreHeader) + aic_record_capacity * sizeof(CycleTraceRecord);
-    uint32_t aiv_stride_bytes =
-      sizeof(CycleTraceCoreHeader) + aiv_record_capacity * sizeof(CycleTraceRecord);
+                              uint32_t aiv_record_capacity) {
+    if (aic_record_capacity > MAX_RECORDS_PER_CORE || aiv_record_capacity > MAX_RECORDS_PER_CORE ||
+        aic_record_capacity % 16 != 0 || aiv_record_capacity % 16 != 0) {
+      AscendC::Trap();
+      return;
+    }
+    uint64_t aic_stride_bytes =
+      sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aic_record_capacity) * sizeof(CycleTraceRecord);
+    uint64_t aiv_stride_bytes =
+      sizeof(CycleTraceCoreHeader) + static_cast<uint64_t>(aiv_record_capacity) * sizeof(CycleTraceRecord);
 #ifdef __DAV_C220_CUBE__
     uint32_t core_type = 1;
     record_capacity_ = aic_record_capacity;
@@ -64,8 +70,7 @@ class CycleTraceRecorder {
 #else
     uint32_t core_type = 2;
     record_capacity_ = aiv_record_capacity;
-    GM_ADDR profile_slot_ptr = profile_buffer + NUM_WORKERS_CUBE * aic_stride_bytes +
-                               worker_id * aiv_stride_bytes;
+    GM_ADDR profile_slot_ptr = profile_buffer + NUM_WORKERS_CUBE * aic_stride_bytes + worker_id * aiv_stride_bytes;
 #endif
     profile_header_ = reinterpret_cast<__gm__ CycleTraceCoreHeader *>(profile_slot_ptr);
     record_count_ = 0;
@@ -75,7 +80,7 @@ class CycleTraceRecorder {
     profile_header_->coreType = core_type;
     profile_header_->blockId = worker_id;
     profile_header_->recordCapacity = record_capacity_;
-    for (uint32_t i = 0; i < 9; ++i) {
+    for (uint32_t i = 0; i < CYCLE_TRACE_RESERVED_WORDS; ++i) {
       profile_header_->reserved[i] = 0;
     }
   }
@@ -111,5 +116,7 @@ class CycleTraceRecorder {
   uint32_t record_count_ = 0;
   uint32_t record_capacity_ = 0;
 };
+
+}  // namespace MulticoreRuntime
 
 #endif  // MULTICORE_SCHEDULER_CYCLE_TRACE_RECORDER_H

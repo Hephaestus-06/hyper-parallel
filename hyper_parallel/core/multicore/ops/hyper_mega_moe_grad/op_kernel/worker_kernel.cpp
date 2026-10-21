@@ -13,6 +13,8 @@
  * @brief MoE-FFN backward — op-specific compute kernels + KernelWorker specialization.
  */
 
+#include <cstddef>
+
 #include "kernel_operator.h"
 #include "swi_glu/swi_glu.cpp"
 #include "swi_glu_grad/swi_glu_grad.cpp"
@@ -22,31 +24,50 @@
 
 using namespace AscendC;
 
+namespace MulticoreRuntime {
+
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe_grad (backward):
-  //   [30] = tiling params  [31] = all_event_counters  [32] = profile_buffer
+  //   [30] = tiling params  [31] = all_event_counters  [32] = diagnostic_buffer
   //   [25] = gmm_workspace  [26] = swi_glu_grad_workspace
   static constexpr uint32_t TILING_IDX              = 30;
   static constexpr uint32_t EVENT_IDX               = 31;
-  static constexpr uint32_t PROFILE_IDX             = 32;
+  static constexpr uint32_t DIAGNOSTIC_IDX          = 32;
   static constexpr uint32_t WORKSPACE_IDX           = 25;
   static constexpr uint32_t SWIGLU_GRAD_WORKSPACE_IDX = 26;
+  static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
+    static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));
+  static constexpr int64_t SWIGLU_DYNAMIC_FIELDS_BYTES =
+    offsetof(SwiGluTilingData, baseRowLen) + sizeof(uint32_t) - SWIGLU_DYNAMIC_FIELDS_OFFSET;
+  static constexpr uint32_t GMM_BASE_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, gmmBaseParams) + offsetof(GMMBaseParams, m));
+  static constexpr uint32_t GMM_MATMUL_M_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, M));
+  static constexpr int64_t GMM_MATMUL_M_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreM) + sizeof(int32_t) - offsetof(TCubeTiling, M);
+  static constexpr uint32_t GMM_MATMUL_K_OFFSET = static_cast<uint32_t>(
+    offsetof(GMMTilingData, mmTilingData) + offsetof(TCubeTiling, Ka));
+  static constexpr int64_t GMM_MATMUL_K_FIELDS_BYTES =
+    offsetof(TCubeTiling, singleCoreK) + sizeof(int32_t) - offsetof(TCubeTiling, Ka);
 
   __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
     switch (task_desc.task_type) {
-      case TASK_BEGIN_TASK_GRAPH:
+      case TaskType::TASK_BEGIN_TASK_GRAPH:
         break;
-      case TASK_MATMUL:
+      case TaskType::TASK_MATMUL:
         ExecuteMatmul(task_desc);
         break;
-      case TASK_GROUPED_MATMUL:
+      case TaskType::TASK_GROUPED_MATMUL:
         ExecuteGroupedMatmul(task_desc);
         break;
-      case TASK_SHMEM_PUT_MEM_SIGNAL:
+      case TaskType::TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
-      case TASK_SWI_GLU_GRAD:
+      case TaskType::TASK_SHMEM_GET_MEM:
+        ExecuteShmemGetMem<DTYPE_DISPATCH_TARGET>(task_desc);
+        break;
+      case TaskType::TASK_SWI_GLU_GRAD:
         ExecuteSwiGluGrad(task_desc);
         break;
       default:
@@ -55,6 +76,15 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
   }
 
  private:
+  __aicore__ inline float GetSwiGluClampLimit(const TaskDesc &task_desc) {
+    union {
+      uint32_t bits;
+      float value;
+    } encoded = {};
+    encoded.bits = task_desc.extra_value_0;
+    return encoded.value;
+  }
+
   __aicore__ inline bool getTransposeData(uint32_t data) { return data == 1; }
 
   __aicore__ inline void ExecuteMatmul(const TaskDesc &task_desc) {}
@@ -65,8 +95,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     }
     __gm__ uint8_t *start =
       (__gm__ uint8_t *)((int64_t)sourceAddr / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
-    __gm__ uint8_t *end = (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE *
-                                             AscendC::CACHE_LINE_SIZE);
+    __gm__ uint8_t *end =
+      (__gm__ uint8_t *)(((int64_t)sourceAddr + length - 1) / AscendC::CACHE_LINE_SIZE * AscendC::CACHE_LINE_SIZE);
     AscendC::GlobalTensor<uint8_t> global;
     global.SetGlobalBuffer(start);
     for (uint32_t i = 0; i <= end - start; i += AscendC::CACHE_LINE_SIZE) {
@@ -119,7 +149,8 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset);
+                       input_list[task_desc.tiling_data_position] + task_desc.tiling_data_offset,
+                       GetSwiGluClampLimit(task_desc));
           return;
         } else {
           GM_ADDR tiling_data_addr = input_list[task_desc.tiling_data_position] + 80 * (AscendC::GetBlockIdx() + 1);
@@ -128,17 +159,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           if (tilingdata_data->rowLen == 0) {
             return;
           }
-          if (end - (start + current_seq_start) < 19) {
-            tilingdata_data->baseRowLen = end - (start + current_seq_start);
-          }
-          cacheWriteThrough(tiling_data_addr, 10);
+          tilingdata_data->baseRowLen = tilingdata_data->rowLen < SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT
+                                           ? tilingdata_data->rowLen : SWIGLU_DYNAMIC_TAIL_BASE_ROW_LIMIT;
+          cacheWriteThrough(tiling_data_addr + SWIGLU_DYNAMIC_FIELDS_OFFSET, SWIGLU_DYNAMIC_FIELDS_BYTES);
           PipeBarrier<PIPE_ALL>();
 
           swi_glu_grad(input_list[task_desc.inputs[0].input_position] + input_0_offset,
                        input_list[task_desc.inputs[1].input_position] + input_1_offset,
                        input_list[task_desc.outputs[0].input_position] + output_0_offset,
                        input_list[SWIGLU_GRAD_WORKSPACE_IDX],
-                       tiling_data_addr);
+                       tiling_data_addr, GetSwiGluClampLimit(task_desc));
         }
       }
       return;
@@ -158,8 +188,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
         int64_t expert_num_single_rank = expert_num / ep;
         grouped_list_tensor.SetGlobalBuffer((__gm__ int64_t *)(grouped_list), expert_num_single_rank);
 
-        GM_ADDR grouped_list_real =
-          this->runtimeConfigPtr + getGroupedMatmulGroupListOffsetById(this->runtimeConfigPtr, AscendC::GetBlockIdx());
+        GM_ADDR grouped_list_real = this->runtimeConfigPtr + this->grouped_matmul_group_list_offset_;
         GlobalTensor<int64_t> grouped_list_tensor_real;
         grouped_list_tensor_real.SetGlobalBuffer((__gm__ int64_t *)(grouped_list_real), expert_num_single_rank);
         uint32_t data_index = task_desc.task_index / this->core_num;
@@ -189,12 +218,14 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
           tilingdata_data->mmTilingData.Ka = value;
           tilingdata_data->mmTilingData.Kb = value;
           tilingdata_data->mmTilingData.singleCoreK = value;
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_K_OFFSET, GMM_MATMUL_K_FIELDS_BYTES);
         } else {
           tilingdata_data->gmmBaseParams.m = value;
           tilingdata_data->mmTilingData.M = value;
           tilingdata_data->mmTilingData.singleCoreM = value;
+          cacheWriteThrough(tiling_data_addr + GMM_BASE_M_OFFSET, sizeof(uint32_t));
+          cacheWriteThrough(tiling_data_addr + GMM_MATMUL_M_OFFSET, GMM_MATMUL_M_FIELDS_BYTES);
         }
-        cacheWriteThrough(tiling_data_addr, 220);
         PipeBarrier<PIPE_ALL>();
 
         int64_t input_0_offset = task_desc.inputs[0].dynamic_shape == 1
@@ -208,12 +239,10 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                                     : task_desc.outputs[0].base_ptr_offset * task_desc.outputs[0].data_type;
 
         grouped_matmul(input_list[task_desc.inputs[0].input_position] + input_0_offset,
-                       input_list[task_desc.inputs[1].input_position] + input_1_offset,
-                       nullptr, nullptr, nullptr, nullptr, nullptr, grouped_list_real, nullptr,
-                       input_list[task_desc.outputs[0].input_position] + output_0_offset,
-                       input_list[WORKSPACE_IDX],
-                       tiling_data_addr,
-                       getTransposeData(task_desc.inputs[0].transpose_flag),
+                       input_list[task_desc.inputs[1].input_position] + input_1_offset, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, grouped_list_real, nullptr,
+                       input_list[task_desc.outputs[0].input_position] + output_0_offset, input_list[WORKSPACE_IDX],
+                       tiling_data_addr, getTransposeData(task_desc.inputs[0].transpose_flag),
                        getTransposeData(task_desc.inputs[1].transpose_flag));
       }
       return;
@@ -244,7 +273,9 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
     int32_t start = value * task_desc.task_split_value * hidden_size;
     int32_t end = (value + 1) * task_desc.task_split_value * hidden_size;
     if (start >= size_) {
-      send_data_size_ = 0;
+      aclshmemx_signal_op(reinterpret_cast<__gm__ int32_t *>(signal) + task_desc.trigger_event, 1, ACLSHMEM_SIGNAL_ADD,
+                          target_pe);
+      return;
     } else {
       if (end > size_) {
         send_data_size_ = size_ - start;
@@ -259,21 +290,16 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
                           target_offset_,
                           input_list[task_desc.inputs[1].input_position] +
                             task_desc.inputs[1].base_ptr_offset * task_desc.inputs[1].data_type,
-                          src_offset_,
-                          send_data_size_,
-                          signal,
-                          static_cast<int64_t>(task_desc.trigger_event),
-                          1,
-                          nullptr,
-                          1,
-                          target_pe,
-                          false);
+                          src_offset_, send_data_size_, signal, static_cast<int64_t>(task_desc.trigger_event), 1,
+                          nullptr, 1, target_pe, false);
   }
 };
 
+}  // namespace MulticoreRuntime
+
 extern "C" inline __aicore__ void worker_kernel(uint32_t worker_id, __gm__ uint8_t *runtimeConfigPtr,
                                                 GM_ADDR *input_list) {
-  KernelWorker worker;
+  MulticoreRuntime::KernelWorker worker;
   worker.Init(worker_id, runtimeConfigPtr, input_list);
   worker.Process();
 }

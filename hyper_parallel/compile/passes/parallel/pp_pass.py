@@ -40,8 +40,9 @@ chunk in a ``PipelineStage``), this pass:
 4. Prunes foreign-stage submodules from the live model (torch's
    ``named_parameters`` then yields only this stage's entries, keeping the
    trainer / optimizer FSDP- and PP-agnostic).
-5. Installs a self-contained ``ScheduleGPipe`` (eager ``dist.isend`` /
-   ``irecv`` P2P) as a ``call_module`` node in a stub graph — the trainer's
+5. Installs a self-contained pipeline schedule (``ScheduleGPipe`` by
+   default; ``Schedule1F1B`` when ``PassConfig.pp_schedule == "1f1b"``) as a
+   ``call_module`` node in a stub graph — the trainer's
    ``graph_module(*flat_inputs)`` dispatches to it unchanged, and the stub
    survives any later ``recompile()`` because the schedule lives in the
    graph itself, not in an overwritten ``forward``.
@@ -66,8 +67,8 @@ from torch import fx, nn
 
 from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...pass_plan import PassPlan
-from .pp_schedule import ScheduleGPipe
+from ...graph_parallel_plan import GraphParallelPlan
+from .pp_schedule import PipelineScheduleBase, get_schedule_class
 
 _LOG = logging.getLogger(__name__)
 
@@ -172,7 +173,7 @@ def _auto_stage_split(model: nn.Module, pp_degree: int) -> List[List[str]]:
             raise ValueError(
                 f"Cannot split {len(children)} top-level children across "
                 f"{pp_degree} PP stages; provide a manual stage plan via "
-                f"PassPlan.pp_stage()"
+                f"GraphParallelPlan.pp_stage()"
             )
         return _even_split(children, pp_degree)
 
@@ -215,8 +216,8 @@ class _StageSplit:
     stage_plan: List[List[str]]
     node_stage: Dict[fx.Node, int]
     node_phase: Dict[fx.Node, str]
-    input_ph: fx.Node
-    label_ph: fx.Node
+    user_input_phs: List[fx.Node]
+    user_input_stages: List[int]
     state_phs: List[fx.Node]
     stage_state_indices: List[int]
     stage_state_fqns: List[str]
@@ -229,8 +230,8 @@ class _GraphClassification:
     stage_state_indices: List[int]
     node_stage: Dict[fx.Node, int]
     node_phase: Dict[fx.Node, str]
-    input_ph: fx.Node
-    label_ph: fx.Node
+    user_input_phs: List[fx.Node]
+    user_input_stages: List[int]
     state_phs: List[fx.Node]
 
 
@@ -278,16 +279,16 @@ class PpPass(GraphPass):
 
     name = "pp_parallel"
 
-    def __init__(self, pass_plan: Optional[PassPlan] = None) -> None:
+    def __init__(self, parallel_plan: Optional[GraphParallelPlan] = None) -> None:
         """Initialize PP pass state.
 
         Args:
-            pass_plan: Declarative plan; ``pp_module_fqns_per_stage`` (from
+            parallel_plan: Declarative plan; ``pp_module_fqns_per_stage`` (from
                 ``pp_stage()``) overrides the automatic even-by-layers
                 split.
         """
         super().__init__()
-        self._pass_plan = pass_plan
+        self._parallel_plan = parallel_plan
 
     def run(
         self,
@@ -303,11 +304,13 @@ class PpPass(GraphPass):
                 resolves to ``world_size``) and ``pp_microbatch_size`` are
                 read directly.
             **kwargs: Must include ``model`` (the live ``nn.Module``); may
-                include ``pass_plan``.
+                include ``parallel_plan``.
 
         Returns:
             The same graph module, rewritten into a stage stub whose
-            ``call_module`` node invokes the installed ``ScheduleGPipe``.
+            ``call_module`` node invokes the installed pipeline schedule
+            (``ScheduleGPipe`` / ``Schedule1F1B`` per
+            ``pass_config.pp_schedule``).
         """
         run_ctx = self._resolve_run_context(pass_config, kwargs)
         if run_ctx is None:
@@ -348,7 +351,7 @@ class PpPass(GraphPass):
                 "PpPass requires the live model via kwargs (model=...) so it "
                 "can resolve the stage plan and prune foreign-stage modules"
             )
-        self._pass_plan = kwargs.get("pass_plan", self._pass_plan)
+        self._parallel_plan = kwargs.get("parallel_plan", self._parallel_plan)
 
         # Skip BEFORE _resolve_group_and_stage so a disabled pass does not
         # execute the collective dist.new_group.
@@ -417,8 +420,8 @@ class PpPass(GraphPass):
             stage_plan=stage_plan,
             node_stage=graph_cls.node_stage,
             node_phase=graph_cls.node_phase,
-            input_ph=graph_cls.input_ph,
-            label_ph=graph_cls.label_ph,
+            user_input_phs=graph_cls.user_input_phs,
+            user_input_stages=graph_cls.user_input_stages,
             state_phs=graph_cls.state_phs,
             stage_state_indices=graph_cls.stage_state_indices,
             stage_state_fqns=[state_fqns[i] for i in graph_cls.stage_state_indices],
@@ -472,6 +475,7 @@ class PpPass(GraphPass):
             split.stage_state_fqns,
             split.state_is_param,
             split.stage_state_indices,
+            len(split.user_input_phs),
         )
 
         _LOG.info(
@@ -554,6 +558,10 @@ class PpPass(GraphPass):
     def _resolve_group_and_stage(self, pass_config: PassConfig) -> Tuple[int, Any, int]:
         """Resolve PP degree, process group, and this rank's stage index.
 
+        A single PP process group carries both forward activations and
+        backward gradients; the schedule keeps the two ends of every
+        neighbour pair's FIFO complementary (see ``Schedule1F1B``).
+
         v1 supports the pure-PP layout (``pp_degree == world_size``, one
         stage per rank); ``pp_degree == 1`` disables the pass. Any other
         layout is rejected loudly: DP replication over one stage would
@@ -595,8 +603,8 @@ class PpPass(GraphPass):
     def _resolve_stage_plan(self, model: nn.Module, pp_degree: int) -> List[List[str]]:
         """Resolve the per-stage module FQN lists (manual plan or auto split)."""
         manual = (
-            self._pass_plan.pp_module_fqns_per_stage
-            if self._pass_plan is not None
+            self._parallel_plan.pp_module_fqns_per_stage
+            if self._parallel_plan is not None
             else None
         )
         if manual is not None:
@@ -657,7 +665,7 @@ class PpPass(GraphPass):
         _LOG.warning(
             "No PP stage declares modules %s — their nodes ride with the "
             "dataflow attribution (consumer stage, then last stage). "
-            "Declare them via PassPlan.pp_stage() if that is not intended.",
+            "Declare them via GraphParallelPlan.pp_stage() if that is not intended.",
             shown,
         )
 
@@ -689,6 +697,13 @@ class PpPass(GraphPass):
            consumers, minimum when several — resolved in reverse topo
         4. last stage as the final fallback (loss chain, dead nodes)
 
+        User-input placeholders are NOT anchors: they are routed AFTER the
+        fwd/bwd classification by dataflow (``_route_user_inputs``) — each
+        rides with the single stage that consumes it, so kwargs-general
+        inputs (multiple features on stage 0, several labels on the last
+        stage, an auxiliary input on a middle stage) all work without
+        positional heuristics.
+
         ``stage_state_indices`` lists the state entries owned by THIS
         stage (``stage_idx``); every state placeholder still gets a stage
         so foreign consumers can be attributed.
@@ -709,8 +724,7 @@ class PpPass(GraphPass):
             state_phs,
             deferred_state,
             stage_state_indices,
-            input_ph,
-            label_ph,
+            user_input_phs,
         ) = self._classify_placeholders(
             placeholders,
             node_stage,
@@ -726,6 +740,9 @@ class PpPass(GraphPass):
         self._classify_backward_nodes(
             graph, state_ph_set, num_stages, node_stage, node_phase
         )
+        user_input_stages = self._route_user_inputs(
+            user_input_phs, node_stage, num_stages
+        )
         self._assign_deferred_state(
             deferred_state,
             state_phs,
@@ -735,16 +752,12 @@ class PpPass(GraphPass):
             stage_state_indices,
         )
 
-        if input_ph is None or label_ph is None:
-            raise ValueError(
-                "Joint graph must expose (state..., input, label) placeholders"
-            )
         return _GraphClassification(
             stage_state_indices=sorted(stage_state_indices),
             node_stage=node_stage,
             node_phase=node_phase,
-            input_ph=input_ph,
-            label_ph=label_ph,
+            user_input_phs=user_input_phs,
+            user_input_stages=user_input_stages,
             state_phs=state_phs,
         )
 
@@ -757,22 +770,32 @@ class PpPass(GraphPass):
         stage_of_fqn: Dict[str, int],
         num_state_inputs: int,
         run_ctx: _RunContext,
-    ) -> Tuple[
-        List[fx.Node], List[int], List[int], Optional[fx.Node], Optional[fx.Node]
-    ]:
+    ) -> Tuple[List[fx.Node], List[int], List[int], List[fx.Node]]:
         """Classify placeholder nodes and collect this stage's state entries.
 
+        Only STATE placeholders get a stage here (via their FQN's module
+        ancestor); user-input placeholders are routed later by dataflow
+        (``_route_user_inputs``), once their consumers' stages are known.
+
+        Args:
+            placeholders: All placeholder nodes in graph order.
+            node_stage: Stage assignment accumulator to fill.
+            node_phase: Phase assignment accumulator to fill.
+            state_fqns: FQNs of the traced state entries (params/buffers).
+            stage_of_fqn: Module FQN -> owning stage map.
+            num_state_inputs: Number of leading state placeholders.
+            run_ctx: This rank's PP execution context.
+
         Returns:
-            ``(state_phs, deferred_state, stage_state_indices, input_ph,
-            label_ph)``. ``deferred_state`` lists root-level state indices
-            whose stage is resolved later from their consumers.
+            ``(state_phs, deferred_state, stage_state_indices,
+            user_input_phs)``. ``deferred_state`` lists root-level state
+            indices whose stage is resolved later from their consumers.
         """
         state_phs: List[fx.Node] = []
         deferred_state: List[int] = []
         stage_state_indices: List[int] = []
-        input_ph: Optional[fx.Node] = None
-        label_ph: Optional[fx.Node] = None
         for idx, ph in enumerate(placeholders):
+            node_phase[ph] = _FWD
             if idx < num_state_inputs:
                 stage = self._state_stage(state_fqns[idx], stage_of_fqn)
                 state_phs.append(ph)
@@ -782,14 +805,70 @@ class PpPass(GraphPass):
                     node_stage[ph] = stage
                     if stage == run_ctx.stage_idx:
                         stage_state_indices.append(idx)
-            elif idx == num_state_inputs:
-                input_ph = ph
-                node_stage[ph] = 0
+        user_input_phs = list(placeholders[num_state_inputs:])
+        return state_phs, deferred_state, stage_state_indices, user_input_phs
+
+    @staticmethod
+    def _route_user_inputs(
+        user_input_phs: List[fx.Node],
+        node_stage: Dict[fx.Node, int],
+        num_stages: int,
+    ) -> List[int]:
+        """Assign each user-input placeholder to the stage consuming it.
+
+        Runs after the fwd/bwd classification, so every consumer node
+        already carries its final stage (user inputs are deliberately not
+        anchors — see ``_classify_graph``). Each consumed input must feed
+        exactly one stage: the schedule ships user inputs directly to their
+        owner (no P2P), so an input consumed on several stages has no
+        route. An input consumed by NO node (an ignored kwarg — the
+        hand-built test fixtures' ``y``, an ``epoch`` scalar train_fn never
+        reads) is warned about and routed to the last stage, where unused
+        inputs have always ridden.
+
+        Args:
+            user_input_phs: User-input placeholders in stub arg order.
+            node_stage: Final per-node stage assignment (fwd+bwd done).
+            num_stages: Total PP stage count.
+
+        Returns:
+            The stage index per user input, in stub arg order.
+
+        Raises:
+            ValueError: When an input is consumed by nodes on more than
+                one stage.
+        """
+        stages: List[int] = []
+        for ph in user_input_phs:
+            consumer_stages = {
+                node_stage[u]
+                for u in ph.users
+                if u.op != "output" and node_stage.get(u) is not None
+            }
+            if not consumer_stages:
+                _LOG.warning(
+                    "Model input '%s' is not consumed by the traced graph — "
+                    "routing it to the last stage with the other unused "
+                    "inputs (a misspelled keyword argument would leave its "
+                    "tensor unused too)",
+                    ph.name,
+                )
+                stage = num_stages - 1
+            elif len(consumer_stages) > 1:
+                raise ValueError(
+                    f"Model input '{ph.name}' is consumed on stages "
+                    f"{sorted(consumer_stages)} — PP ships each user input "
+                    f"directly to the single stage that consumes it; split "
+                    f"the input per stage or restructure the graph"
+                )
             else:
-                label_ph = ph
-                node_stage[ph] = run_ctx.pp_degree - 1
-            node_phase[ph] = _FWD
-        return state_phs, deferred_state, stage_state_indices, input_ph, label_ph
+                stage = next(iter(consumer_stages))
+            node_stage[ph] = stage
+            stages.append(stage)
+            _LOG.info(
+                "User input '%s' routed to stage %s of %s", ph.name, stage, num_stages
+            )
+        return stages
 
     def _classify_forward_nodes(
         self,
@@ -1063,7 +1142,7 @@ class PpPass(GraphPass):
                     f"values between neighbouring stages only. A skip "
                     f"connection spanning 2+ stages or a stage plan that "
                     f"leaves modules unattributed produces this — adjust "
-                    f"PassPlan.pp_stage() so the dataflow crosses one cut "
+                    f"GraphParallelPlan.pp_stage() so the dataflow crosses one cut "
                     f"at a time."
                 )
 
@@ -1153,8 +1232,8 @@ class PpPass(GraphPass):
         grad_out_list = crossing(k, k - 1, None) if k > 0 else []
 
         # Forward-phase values the backward references. Stage-owned
-        # placeholders (state / input / label of this stage) may appear and
-        # round-trip through the forward outputs; foreign placeholders
+        # placeholders (state / routed user inputs of this stage) may appear
+        # and round-trip through the forward outputs; foreign placeholders
         # cannot be shipped and fail loudly during the slice copy.
         stage_owned_phs = {
             p
@@ -1190,8 +1269,8 @@ class PpPass(GraphPass):
     ) -> List[fx.Node]:
         """Forward-phase values this stage's backward references.
 
-        Stage-owned placeholders (state / input / label of this stage) may
-        appear and round-trip through the forward outputs; foreign
+        Stage-owned placeholders (state / routed user inputs of this stage)
+        may appear and round-trip through the forward outputs; foreign
         placeholders cannot be shipped and fail loudly during the slice
         copy. Fwd-phase values this stage must ship BACKWARD (consumed by
         the previous stage's backward) ride the fwd outputs as
@@ -1325,10 +1404,12 @@ class PpPass(GraphPass):
         split: _StageSplit,
         boundaries: _Boundaries,
     ) -> None:
-        """Create the fwd subgraph's placeholders (state / boundary / input).
+        """Create the fwd subgraph's placeholders (state / boundary / inputs).
 
-        Incoming boundary values (stage k > 0) become placeholders; stage 0
-        takes the full input and the last stage the label.
+        Incoming boundary values (stage k > 0) become placeholders; each
+        stage additionally takes the user inputs routed to it (stage 0
+        typically the feature batch, the last stage the labels; see
+        ``_route_user_inputs``).
         """
         for i, orig_idx in enumerate(split.stage_state_indices):
             ph = builder.g.placeholder(
@@ -1342,15 +1423,14 @@ class PpPass(GraphPass):
             ph.meta = dict(act.meta)
             builder.foreign[act] = ph
 
-        if run_ctx.stage_idx == 0:
-            in_ph = builder.g.placeholder(self._unique("pp_input", builder.used))
-            in_ph.meta = dict(split.input_ph.meta)
-            builder.env[split.input_ph] = in_ph
-
-        if run_ctx.stage_idx == run_ctx.pp_degree - 1:
-            lbl_ph = builder.g.placeholder(self._unique("pp_label", builder.used))
-            lbl_ph.meta = dict(split.label_ph.meta)
-            builder.env[split.label_ph] = lbl_ph
+        for i, (ph, stage) in enumerate(
+            zip(split.user_input_phs, split.user_input_stages)
+        ):
+            if stage != run_ctx.stage_idx:
+                continue
+            in_ph = builder.g.placeholder(self._unique(f"pp_input_{i}", builder.used))
+            in_ph.meta = dict(ph.meta)
+            builder.env[ph] = in_ph
 
     @staticmethod
     def _resolve_fwd_outputs(
@@ -1656,8 +1736,8 @@ class PpPass(GraphPass):
         split: _StageSplit,
         num_trainable: int,
         boundaries: _Boundaries,
-    ) -> ScheduleGPipe:
-        """Assemble the ``ScheduleGPipe`` for this stage.
+    ) -> PipelineScheduleBase:
+        """Assemble this stage's pipeline schedule (``pass_config.pp_schedule``).
 
         Receive descriptors come from the boundary values' fake-tensor
         ``val`` metas; the send side packs by value type at runtime.
@@ -1672,7 +1752,8 @@ class PpPass(GraphPass):
             if run_ctx.stage_idx < run_ctx.pp_degree - 1
             else []
         )
-        return ScheduleGPipe(
+        schedule_cls = get_schedule_class(pass_config.pp_schedule)
+        return schedule_cls(
             fwd_gm,
             bwd_gm,
             stage_idx=run_ctx.stage_idx,
@@ -1685,23 +1766,28 @@ class PpPass(GraphPass):
             pp_group=run_ctx.group,
             recv_spec=recv_spec,
             grad_recv_spec=grad_recv_spec,
+            user_input_stages=split.user_input_stages,
         )
 
     def _install_stub(
         self,
         graph_module: fx.GraphModule,
-        sched: ScheduleGPipe,
+        sched: PipelineScheduleBase,
         stage_state_fqns: List[str],
         state_is_param: Sequence[bool],
         stage_state_indices: List[int],
+        num_user_inputs: int,
     ) -> None:
         """Rewrite the graph module into a schedule-dispatching stub.
 
         The schedule is added as a submodule and invoked through a
         ``call_module`` node, so it survives any later ``recompile()`` and
         the trainer's ``graph_module(*flat_inputs)`` dispatches to it
-        unchanged. ``state_fqns`` / ``state_is_param`` are updated IN PLACE
-        (the JointGraph shares the list objects).
+        unchanged. The stub takes ``(*state, *user_inputs)`` — every rank
+        receives the full flattened user-input list; the schedule picks
+        the inputs routed to this stage. ``state_fqns`` /
+        ``state_is_param`` are updated IN PLACE (the JointGraph shares the
+        list objects).
         """
         g = fx.Graph()
         used: Set[str] = set()
@@ -1709,11 +1795,13 @@ class PpPass(GraphPass):
             g.placeholder(self._unique(_sanitize(fqn), used))
             for fqn in stage_state_fqns
         ]
-        in_ph = g.placeholder(self._unique("pp_input", used))
-        lbl_ph = g.placeholder(self._unique("pp_label", used))
+        user_phs = [
+            g.placeholder(self._unique(f"pp_input_{i}", used))
+            for i in range(num_user_inputs)
+        ]
 
         graph_module.add_module("pp_schedule", sched)
-        call = g.call_module("pp_schedule", args=tuple(state_phs) + (in_ph, lbl_ph))
+        call = g.call_module("pp_schedule", args=tuple(state_phs) + tuple(user_phs))
         g.output(call)
 
         graph_module.graph = g

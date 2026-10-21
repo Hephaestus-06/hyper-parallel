@@ -211,6 +211,9 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
                     raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
+                swap_manager.warn_missing_group_once()
+                return tensor.detach()
+            if swap_manager.is_last_group(group_name):
                 return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)

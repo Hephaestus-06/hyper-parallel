@@ -44,6 +44,14 @@ def _get_attribute(root: Any, path: str) -> Any:
     return value
 
 
+def _is_named_layer(item: Any) -> bool:
+    """Return whether an item is a valid ``(fqn, module)`` pair."""
+    if not isinstance(item, tuple) or len(item) != 2:
+        return False
+    name, layer = item
+    return isinstance(name, str) and isinstance(layer, nn.Module)
+
+
 def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
     """Normalize the model-owned decoder-layer contract."""
     if isinstance(declared, nn.ModuleList):
@@ -59,12 +67,7 @@ def _normalize_declared_layers(declared: Any) -> list[tuple[str, nn.Module]]:
         if isinstance(item, nn.Module):
             layers.append((str(index), item))
             continue
-        if (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and isinstance(item[0], str)
-            and isinstance(item[1], nn.Module)
-        ):
+        if _is_named_layer(item):
             layers.append(item)
             continue
         raise TypeError(
@@ -233,9 +236,20 @@ def _resolve_compile_config(
         compile_config = CompileConfig(enabled=True, **compile_config)
     if compile_config is not None and not isinstance(compile_config, CompileConfig):
         raise TypeError("compile_config must be a CompileConfig, mapping, or None")
-    compile_for_execution = bool(
-        not validate_placement and compile_config is not None and compile_config.enabled
+    graph_mode_requested = bool(
+        compile_config is not None and compile_config.selects_graph_compiler()
     )
+    compile_for_execution = bool(
+        not validate_placement
+        and compile_config is not None
+        and compile_config.enabled
+        and not graph_mode_requested
+    )
+    if graph_mode_requested:
+        logger.info(
+            "compile.use_joint_graph=True selects graph-mode trainer; "
+            "skipping decoder-layer compile",
+        )
     if validate_placement and compile_config is not None and compile_config.enabled:
         logger.info("Skipping decoder-layer compile during placement validation")
     if compile_for_execution and compile_config.fullgraph and isinstance(fsdp2_manager, FSDP2Manager):

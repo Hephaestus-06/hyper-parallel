@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Checkpoint management for finalized HyperParallel models."""
+# pylint: disable=forbidden-backend-import
 
 import json
 import logging
@@ -37,13 +38,19 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     revert_weight_conversion,
 )
 
+# PEP 604 unions (``str | Path``, ``DCPBackend | None``, ``list[A | B] | None``) are valid on
+# this interpreter, but the checker evaluates them and reports a false
+# ``unsupported-binary-operation`` at every site -- 10 of them, all present on the base
+# revision this file was branched from.
+# pylint: disable=unsupported-binary-operation
+
 from hyper_parallel import DTensor, Partial, distribute_tensor
 
 logger = logging.getLogger(__name__)
 
 _SAFE_WEIGHTS_NAME = "model.safetensors"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
-_SNAPSHOT_PATTERNS = ("*.safetensors", "*.safetensors.index.json")
+_SNAPSHOT_PATTERNS = ("*.safetensors", "*.safetensors.index.json", "engram_host_rows.json")
 
 
 @dataclass(frozen=True)
@@ -65,7 +72,11 @@ class DCPBackend(Protocol):
         checkpoint_id: str | Path,
         **kwargs: Any,
     ) -> Any:
-        """Load a DCP checkpoint into the supplied sharded state dict."""
+        """Load a DCP checkpoint into the supplied sharded state dict.
+
+        Args:
+            state_dict: State dictionary to read or write.
+        """
 
     def save(
         self,
@@ -74,7 +85,11 @@ class DCPBackend(Protocol):
         checkpoint_id: str | Path,
         **kwargs: Any,
     ) -> Any:
-        """Save the supplied sharded state dict as DCP."""
+        """Save the supplied sharded state dict as DCP.
+
+        Args:
+            state_dict: State dictionary to read or write.
+        """
 
 
 @dataclass(frozen=True)
@@ -88,7 +103,11 @@ class _CheckpointIndex:
         return tuple(sorted(self.files_by_key, key=dot_natural_key))
 
     def load_tensor(self, key: str) -> torch.Tensor:
-        """Materialize one checkpoint tensor on CPU."""
+        """Materialize one checkpoint tensor on CPU.
+
+        Args:
+            key: Checkpoint tensor key.
+        """
         file_path = self.files_by_key.get(key)
         if file_path is None:
             raise ValueError(f"Checkpoint key is not indexed: {key}")
@@ -119,7 +138,11 @@ class _SourceModelView:
         }
 
     def get_parameter(self, name: str) -> _TensorShape:
-        """Return source parameter metadata used by shape-aware converters."""
+        """Return source parameter metadata used by shape-aware converters.
+
+        Args:
+            name: Parameter name.
+        """
         try:
             return self._targets[name]
         except KeyError as exc:
@@ -486,8 +509,14 @@ class CheckpointManager:
         *,
         strict: bool = True,
         weights_mapping: list[WeightRenaming | WeightConverter] | None = None,
+        external_target_fqns: frozenset[str] = frozenset(),
+        claimed_source_keys: frozenset[str] = frozenset(),
     ) -> LoadReport:
-        """Load complete Hugging Face weights into the finalized model."""
+        """Load complete Hugging Face weights into the finalized model.
+
+        Args:
+            pretrained_path: Source checkpoint path.
+        """
         if not pretrained_path:
             raise ValueError("pretrained_path must be provided when load_base_model=True")
         if weights_mapping is None:
@@ -499,6 +528,17 @@ class CheckpointManager:
 
         checkpoint_index = _resolve_checkpoint_index(pretrained_path)
         targets = _build_load_targets(self.model)
+        if not external_target_fqns <= targets.keys():
+            raise ValueError("External target is absent from the model")
+        # An external reader may consume a logical key from its own validated
+        # row manifest rather than a tensor in the ordinary safetensors index.
+        if external_target_fqns:
+            targets = {key: value for key, value in targets.items() if key not in external_target_fqns}
+        if claimed_source_keys:
+            checkpoint_index = _CheckpointIndex({
+                key: value for key, value in checkpoint_index.files_by_key.items()
+                if key not in claimed_source_keys
+            })
         replacement_mapping = getattr(
             self.model,
             "_hp_replacement_weight_conversions",
@@ -659,6 +699,9 @@ class CheckpointManager:
 
         Returns:
             True on the writing rank and False on all other ranks.
+
+        Args:
+            save_directory: Destination directory for saved weights.
         """
         save_method = getattr(self.model, "save_pretrained", None)
         if not callable(save_method):
@@ -701,7 +744,11 @@ class CheckpointManager:
         strict: bool = True,
         **kwargs: Any,
     ) -> Any:
-        """Delegate DCP loading, then apply the restored sharded model state."""
+        """Delegate DCP loading, then apply the restored sharded model state.
+
+        Args:
+            checkpoint_id: Distributed checkpoint path.
+        """
         backend = self._require_dcp_backend()
         model_state = self.model.state_dict()
         state_dict = {"model": model_state}
@@ -714,7 +761,11 @@ class CheckpointManager:
         return result
 
     def save_dcp(self, checkpoint_id: str | Path, **kwargs: Any) -> Any:
-        """Delegate sharded model-state saving to the configured DCP backend."""
+        """Delegate sharded model-state saving to the configured DCP backend.
+
+        Args:
+            checkpoint_id: Distributed checkpoint path.
+        """
         backend = self._require_dcp_backend()
         return backend.save(
             {"model": self.model.state_dict()},
@@ -887,6 +938,7 @@ def _mark_loaded_targets_initialized(
     _validate_materialized(loaded_targets)
     for target in loaded_targets:
         target.tensor._is_hf_initialized = True  # pylint: disable=W0212
+        target.module._is_hf_initialized = True  # pylint: disable=W0212
         snapshots[target.fqn] = _snapshot_target(target)
     return snapshots
 
@@ -930,6 +982,8 @@ def _resolve_tied_aliases(
             )
         target.tensor._is_hf_initialized = True  # pylint: disable=W0212
         source.tensor._is_hf_initialized = True  # pylint: disable=W0212
+        target.module._is_hf_initialized = True  # pylint: disable=W0212
+        source.module._is_hf_initialized = True  # pylint: disable=W0212
         initialized_aliases.update((target_name, source_name))
     return initialized_aliases
 
@@ -1056,7 +1110,7 @@ def _finalize_model_loading(
     initialization_targets = [
         target
         for target in targets.values()
-        if target.is_non_persistent or target.fqn in missing_keys
+        if not target.is_non_persistent and target.fqn in missing_keys
     ]
     _validate_missing_initialization_targets(initialization_targets, missing_keys)
     _validate_materialized(initialization_targets)
@@ -1094,5 +1148,26 @@ def load_pretrained_weights(
     *,
     strict: bool = True,
 ) -> LoadReport:
-    """Backward-compatible functional wrapper around CheckpointManager."""
-    return CheckpointManager(model).load_checkpoint(pretrained_path, strict=strict)
+    """Load Hugging Face pretrained weights into an already-finalized model.
+
+    The model build path (``apply_model_infrastructure``) stages the checkpoint and
+    finalizes it internally; this wrapper is for callers that own a finalized model
+    -- for example a demo builder that constructs with ``from_config`` for a random
+    init and then wants the real weights instead.  Staging alone is not enough:
+    :func:`_finalize_model_loading` performs the deferred copy and marks the loaded
+    tensors initialized, so both steps belong here.
+
+    Args:
+        model: Finalized (sharded and materialized) model to load into.
+        pretrained_path: Local Hugging Face checkpoint directory or file.
+        strict: Raise when an owned model tensor is left unloaded; a partial load
+            is a silently half-random model, so this defaults to ``True``.
+
+    Returns:
+        The load report, after finalization.
+
+    Raises:
+        RuntimeError: If ``strict`` is set and owned tensors are missing.
+    """
+    report = CheckpointManager(model).load_checkpoint(pretrained_path, strict=False)
+    return _finalize_model_loading(model, report, strict=strict)

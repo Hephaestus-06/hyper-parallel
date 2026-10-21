@@ -28,19 +28,23 @@ placement) are deliberately out of scope: ``GraphTrainer`` composes this
 class and owns them.
 """
 
+from __future__ import annotations
+
 __all__ = ["GraphCompiler"]
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
-from .pass_config import PassConfig
-from .pass_plan import PassPlan
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+
+from .pass_config import PassConfig, normalize_dp_mode, build_pass_config_from_trainer_config
+from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
+from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 _LOG = logging.getLogger(__name__)
@@ -59,18 +63,25 @@ class GraphCompiler:
         self,
         model: torch.nn.Module,
         train_fn: Callable,
-        pass_config: PassConfig,
-        pass_plan: Optional[PassPlan] = None,
+        pass_config: Optional[PassConfig] = None,
+        parallel_plan: Optional[GraphParallelPlan] = None,
+        trainer_config: Optional[Any] = None,
         device: Optional[torch.device] = None,
         mesh_context: Optional[Any] = None,
+        dynamic: Optional[bool] = None,
+        dynamic_arg_dims: dict[str, int | list[int]] | None = None,
     ) -> None:
         """
         Args:
             model: Model to compile
             train_fn: Training function signature: (model, input, label) -> loss
-            pass_config: Parallel configuration
-            pass_plan: PassPlan declaring which modules to shard (optional;
-                enables declarative sharding)
+            pass_config: Parallel configuration. When omitted, the compiler
+                projects ``trainer_config`` onto a graph-mode ``PassConfig``;
+                if both are omitted, it uses ``PassConfig()``.
+            parallel_plan: GraphParallelPlan declaring which modules to shard
+                (optional; enables declarative sharding)
+            trainer_config: Optional trainer topology used only to infer a
+                default ``PassConfig`` when ``pass_config`` is omitted.
             device: Device to place the model and run the graph on. Defaults
                 to the NPU device when available, otherwise CPU.
             mesh_context: Optional automodel ``MeshContext`` carrying a
@@ -79,11 +90,24 @@ class GraphCompiler:
                 only the FSDP shard sub-mesh is registered under ``"fsdp"``.
                 Use this to feed an automodel TP-sharded model into the
                 graph-mode FSDP pass.
+            dynamic: Symbolize user input dimensions; inherits trainer_config.compile.dynamic when omitted.
+            dynamic_arg_dims: Optional dotted input paths to dynamic dimensions, e.g. {"x": [0, 1]}.
+                Overrides automatic dimension selection and inherits trainer configuration when omitted.
         """
+        compile_config = getattr(trainer_config, "compile", None)
+        self.dynamic = getattr(compile_config, "dynamic", False) if dynamic is None else dynamic
+        if not isinstance(self.dynamic, bool):
+            raise ValueError("dynamic must be a bool")
+        if dynamic_arg_dims is None:
+            dynamic_arg_dims = getattr(compile_config, "dynamic_arg_dims", None)
+        self.dynamic_arg_dims = normalize_dynamic_arg_dims(dynamic_arg_dims)
         self.model = model
         self.train_fn = train_fn
-        self.pass_config = pass_config
-        self.pass_plan = pass_plan
+        self.parallel_plan = parallel_plan
+        self.pass_config = self._resolve_pass_config(
+            pass_config=pass_config,
+            trainer_config=trainer_config,
+        )
         self._mesh_context = mesh_context
         self.device = device or (
             torch.device("npu")
@@ -91,22 +115,47 @@ class GraphCompiler:
             else torch.device("cpu")
         )
 
-        pass_config.validate()
+        self.pass_config.validate()
 
         self._joint_graph = None
+        self._pytree_pre_hook: Optional[Callable[[], None]] = None
+
+    @staticmethod
+    def _resolve_pass_config(
+        *,
+        pass_config: Optional[PassConfig],
+        trainer_config: Optional[Any],
+    ) -> PassConfig:
+        """Resolve pass configuration from explicit or trainer-level input."""
+        if pass_config is not None:
+            return pass_config
+        if trainer_config is not None:
+            return build_pass_config_from_trainer_config(trainer_config)
+        return PassConfig()
 
     @property
     def is_compiled(self) -> bool:
         """Whether a joint graph has already been compiled."""
         return self._joint_graph is not None
 
-    def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
+    def compile(self, **inputs: Any) -> None:
         """
         Compile model into parallel graph
 
         Users can explicitly call this, or it will be automatically compiled
         at first forward_backward
+
+        Args:
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments and used to trace the joint graph
         """
+        if (self.dynamic or self.dynamic_arg_dims is not None) and self.pass_config.pp_enabled:
+            raise ValueError(
+                "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
+            )
+        if self._pytree_pre_hook is not None:
+            self._pytree_pre_hook()
+
         if self.pass_config.fsdp_enabled and dist.is_initialized():
             # Only build the FSDP mesh when distributed is actually up.
             # ``FSDPPass`` early-returns when ``world_size == 1``, so a
@@ -114,11 +163,12 @@ class GraphCompiler:
             # runs as plain graph mode without sharding.
             self._init_device_mesh(self._mesh_context)
 
-        joint_graph = trace_model_graph(
-            self.model, self.train_fn, input_batch, label_batch
-        )
+        trace_kwargs = {}
+        if self.dynamic or self.dynamic_arg_dims is not None:
+            trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
+        joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
 
-        pipeline = PassPipeline.from_config(self.pass_config, self.pass_plan)
+        pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
         pass_kwargs = self._build_pass_kwargs()
 
@@ -126,11 +176,11 @@ class GraphCompiler:
         # transformed graph lives on ``joint_graph`` for ``forward_backward``.
         pipeline.run(joint_graph.graph_module, **pass_kwargs)
 
+        if joint_graph.input_guards is not None:
+            joint_graph.input_guards.refresh()
         self._joint_graph = joint_graph
 
-    def forward_backward(
-        self, input_batch: torch.Tensor, label_batch: torch.Tensor
-    ) -> Any:
+    def forward_backward(self, **inputs: Any) -> Any:
         """
         Execute one compiled forward+backward step.
 
@@ -139,20 +189,28 @@ class GraphCompiler:
         run before the caller's optimizer step / zero_grad.
 
         Args:
-            input_batch: Input batch (must live on the compiler's device)
-            label_batch: Label batch (must live on the compiler's device)
+            **inputs: Model inputs, forwarded to ``train_fn`` as keyword
+                arguments (must live on the compiler's device)
 
         Returns:
-            loss: Loss value
+            tuple: ``(loss, loss_dict)`` — the backward loss and the named
+            loss values emitted by ``train_fn`` as extra graph outputs after
+            the gradients (empty when ``train_fn`` returned a bare loss
+            tensor).
         """
         if self._joint_graph is None:
-            self.compile(input_batch, label_batch)
+            self.compile(**inputs)
 
-        loss, grads = self._run_graph(input_batch, label_batch)
+        loss, grads, loss_dict = self._run_graph(**inputs)
 
         self._accumulate_grads(grads)
 
-        return loss
+        return loss, loss_dict
+
+    def set_pytree_pre_hook(self, hook: Callable[[], None]) -> "GraphCompiler":
+        """Register a no-arg hook run immediately before first compilation."""
+        self._pytree_pre_hook = hook
+        return self
 
     def to(self, device: torch.device) -> "GraphCompiler":
         """Move the model to ``device`` and remember it for graph execution."""
@@ -161,53 +219,239 @@ class GraphCompiler:
         return self
 
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
-        """Initialize the FSDP process group.
+        """Initialize the DP process group(s) for the configured ``dp_mode``.
 
-        Two modes:
+        Three modes (see ``PassConfig.dp_mode``), matching simplefsdp's
+        ``data_parallel`` and the eager ``fully_shard`` conventions:
 
-        * **External mesh** (``mesh_context`` from automodel): the TP group is
-          already created by automodel (the boundary forward holds the group
-          object directly), so we only resolve the FSDP shard sub-mesh and
-          register it under the name ``"fsdp"`` so ``FSDPPass``'s functional
-          collectives resolve it by name. ``fsdp_degree`` is back-filled on
-          ``pass_config`` from the sub-mesh size — essential for a TP+FSDP
-          hybrid, where the FSDP group is a proper sub-group of the world and
-          must NOT be confused with ``world_size``.
-        * **Fallback** (no mesh): build a 1-D ``("fsdp",)`` mesh over the
-          whole world (the original FSDP-only path).
+        * ``"fsdp"`` (default): a 1-D ``("fsdp_shard",)`` mesh; the group is
+          registered under the graph-mode name ``"fsdp"``.
+        * ``"ddp"``: a 1-D ``("fsdp_replicate",)`` mesh; registered under
+          ``"dp_replicate"`` (no parameter sharding, grads all-reduced).
+        * ``"hsdp"``: a 2-D ``("fsdp_replicate", "fsdp_shard")`` mesh
+          (replicate, shard); both groups registered.
+
+        An external automodel ``MeshContext`` is reused when provided — its
+        ``fsdp_replicate`` / ``fsdp_shard`` sub-meshes are registered under the
+        graph-mode names, mirroring the eager ``FSDP2Manager``. The fallback
+        builds the mesh with the repo ``init_device_mesh`` (the same builder the
+        eager stack uses) and only supports **pure DP** (``tp_size == 1``, PP
+        off); TP/PP topologies must supply a ``MeshContext``.
         """
+        dp_mode = normalize_dp_mode(self.pass_config.dp_mode)
         if mesh_context is not None:
-            fsdp_mesh = (
-                getattr(mesh_context, "fsdp_non_moe_mesh", None)
-                or mesh_context.device_mesh
-            )
-            names = tuple(getattr(fsdp_mesh, "mesh_dim_names", ()) or ())
-            # automodel's fsdp_non_moe_mesh is ("fsdp_replicate","fsdp_shard","tp");
-            # device_mesh (cp=1) is ("dp","cp","tp") and "dp" is the FSDP axis.
-            dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
-            sub = fsdp_mesh[dim]
-            pg = sub.get_group()
-            _register_process_group("fsdp", pg)
-            self.pass_config.fsdp_degree = sub.size()
+            self._init_mesh_from_context(mesh_context, dp_mode)
             return
 
+        self._require_pure_dp_fallback()
         device_type = (
             "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
         )
         world_size = dist.get_world_size()
+        rank_list = tuple(range(world_size))
 
+        if dp_mode == "ddp":
+            mesh = init_device_mesh(
+                device_type,
+                (world_size,),
+                mesh_dim_names=("fsdp_replicate",),
+                rank_list=rank_list,
+                init_backend=True,
+            )
+            self._register_mesh_group("dp_replicate", mesh["fsdp_replicate"])
+            self.pass_config.dp_replicate_degree = mesh["fsdp_replicate"].size()
+            return
+
+        if dp_mode == "hsdp":
+            shard, replicate = self._resolve_hsdp_degrees(world_size)
+            mesh = init_device_mesh(
+                device_type,
+                (replicate, shard),
+                mesh_dim_names=("fsdp_replicate", "fsdp_shard"),
+                rank_list=rank_list,
+                init_backend=True,
+            )
+            self._register_mesh_group("dp_replicate", mesh["fsdp_replicate"])
+            self._register_mesh_group("fsdp", mesh["fsdp_shard"])
+            self.pass_config.dp_replicate_degree = mesh["fsdp_replicate"].size()
+            self.pass_config.fsdp_degree = mesh["fsdp_shard"].size()
+            return
+
+        # dp_mode == "fsdp" (default): 1-D shard mesh over the whole world.
         mesh = init_device_mesh(
             device_type,
             (world_size,),
-            mesh_dim_names=("fsdp",),
+            mesh_dim_names=("fsdp_shard",),
+            rank_list=rank_list,
+            init_backend=True,
         )
-
-        pg = mesh["fsdp"].get_group()
-        _register_process_group("fsdp", pg)
+        self._register_mesh_group("fsdp", mesh["fsdp_shard"])
         # Back-fill, mirroring the external-mesh branch: FSDPPass resolves the
         # group size from ``fsdp_degree`` (falling back to world_size when
         # ``None``), so setting it here keeps the two paths consistent.
         self.pass_config.fsdp_degree = world_size
+
+    def _require_pure_dp_fallback(self) -> None:
+        """Reject TP/PP topologies for the self-built DP mesh.
+
+        The fallback mesh spans the whole world; with a TP or PP axis it would
+        shard/reduce across the wrong ranks. Those topologies must supply an
+        automodel ``MeshContext`` (which carries the proper DP sub-mesh).
+
+        Raises:
+            ValueError: When ``tp_size != 1`` or ``pp_enabled``.
+        """
+        cfg = self.pass_config
+        if cfg.tp_size != 1 or cfg.pp_enabled:
+            raise ValueError(
+                "Graph-mode DP without a MeshContext only supports pure data "
+                f"parallelism (tp_size=1, PP disabled); got tp_size={cfg.tp_size}, "
+                f"pp_enabled={cfg.pp_enabled}. Pass a MeshContext carrying the DP "
+                "sub-mesh for TP/PP hybrids."
+            )
+
+    def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str) -> None:
+        """Resolve and register the DP group(s) from an automodel ``MeshContext``.
+
+        Reuses automodel's already-built mesh (boundary forwards hold the TP
+        group object directly) and registers the ``fsdp_replicate`` /
+        ``fsdp_shard`` sub-meshes under the graph-mode names ``"dp_replicate"``
+        / ``"fsdp"``. The effective mode is first reconciled with the mesh
+        topology (see ``_reconcile_mode_with_context``), mirroring the eager
+        ``FSDP2Manager`` which picks HSDP from ``dp_replicate_size > 1``.
+        """
+        fsdp_mesh = (
+            getattr(mesh_context, "fsdp_non_moe_mesh", None) or mesh_context.device_mesh
+        )
+        names = tuple(getattr(fsdp_mesh, "mesh_dim_names", ()) or ())
+        dp_mode = self._reconcile_mode_with_context(mesh_context, dp_mode)
+        self.pass_config.dp_mode = dp_mode
+
+        if dp_mode == "ddp":
+            dim = self._first_dim(names, ("fsdp_replicate", "dp_replicate", "dp"))
+            if dim is None:
+                raise ValueError(
+                    "dp_mode='ddp' needs a replicate axis among "
+                    "('fsdp_replicate', 'dp_replicate', 'dp') in the mesh "
+                    f"dims {names}"
+                )
+            sub = fsdp_mesh[dim]
+            self._register_mesh_group("dp_replicate", sub)
+            self.pass_config.dp_replicate_degree = sub.size()
+            return
+
+        if dp_mode == "hsdp":
+            rep_dim = self._first_dim(names, ("fsdp_replicate", "dp_replicate"))
+            shard_dim = self._first_dim(names, ("fsdp_shard", "fsdp", "dp"))
+            if rep_dim is None or shard_dim is None:
+                raise ValueError(
+                    "dp_mode='hsdp' needs both a replicate axis "
+                    "('fsdp_replicate'/'dp_replicate') and a shard axis "
+                    f"('fsdp_shard'/'fsdp'/'dp') in the mesh dims {names}"
+                )
+            rep_sub = fsdp_mesh[rep_dim]
+            shard_sub = fsdp_mesh[shard_dim]
+            self._register_mesh_group("dp_replicate", rep_sub)
+            self._register_mesh_group("fsdp", shard_sub)
+            self.pass_config.dp_replicate_degree = rep_sub.size()
+            self.pass_config.fsdp_degree = shard_sub.size()
+            return
+
+        # dp_mode == "fsdp": automodel's fsdp_non_moe_mesh is
+        # ("fsdp_replicate","fsdp_shard","tp"); device_mesh (cp=1) is
+        # ("dp","cp","tp") and "dp" is the FSDP axis.
+        dim = "fsdp_shard" if "fsdp_shard" in names else "dp"
+        sub = fsdp_mesh[dim]
+        self._register_mesh_group("fsdp", sub)
+        self.pass_config.fsdp_degree = sub.size()
+
+    def _reconcile_mode_with_context(self, mesh_context: Any, dp_mode: str) -> str:
+        """Align ``dp_mode`` with the ``MeshContext`` topology (eager parity).
+
+        The eager ``fully_shard`` path chooses FSDP vs HSDP from the mesh
+        (``dp_replicate_size > 1`` means HSDP), not from a config flag. Mirror
+        that so a mesh carrying a replicate axis is never silently treated as
+        plain FSDP, and a 1-wide replicate axis is treated as FSDP.
+
+        Raises:
+            ValueError: When ``dp_mode='ddp'`` but the mesh shards
+                (``dp_shard_size > 1``).
+        """
+        rep = getattr(mesh_context, "dp_replicate_size", None)
+        shard = getattr(mesh_context, "dp_shard_size", None)
+        if not isinstance(rep, int):
+            # Not a real MeshContext (e.g. a test stub): leave the mode as-is.
+            return dp_mode
+        if dp_mode == "fsdp" and rep > 1:
+            _LOG.warning(
+                "dp_mode='fsdp' but MeshContext.dp_replicate_size=%d > 1; "
+                "using 'hsdp' to match the mesh",
+                rep,
+            )
+            return "hsdp"
+        if dp_mode == "hsdp" and rep <= 1:
+            _LOG.warning(
+                "dp_mode='hsdp' but MeshContext.dp_replicate_size=%d <= 1; "
+                "using 'fsdp'",
+                rep,
+            )
+            return "fsdp"
+        if dp_mode == "ddp" and isinstance(shard, int) and shard > 1:
+            raise ValueError(
+                "dp_mode='ddp' requires a non-sharding mesh "
+                f"(dp_shard_size=1), got dp_shard_size={shard}; use 'hsdp'"
+            )
+        return dp_mode
+
+    @staticmethod
+    def _first_dim(names: tuple, candidates: tuple) -> Optional[str]:
+        """Return the first candidate axis present in ``names`` (or None)."""
+        for cand in candidates:
+            if cand in names:
+                return cand
+        return None
+
+    @staticmethod
+    def _register_mesh_group(name: str, sub_mesh: Any) -> None:
+        """Register ``sub_mesh``'s process group under ``name``."""
+        _register_process_group(name, sub_mesh.get_group())
+
+    def _resolve_hsdp_degrees(self, world_size: int) -> Tuple[int, int]:
+        """Resolve ``(shard, replicate)`` for a fallback 2-D HSDP mesh.
+
+        Either degree may be left ``None`` and is derived from ``world_size``
+        and the other; both must be consistent with ``world_size``.
+
+        Raises:
+            ValueError: When both are ``None``, a degree does not divide
+                ``world_size``, or the product does not equal ``world_size``.
+        """
+        shard = self.pass_config.fsdp_degree
+        replicate = self.pass_config.dp_replicate_degree
+        if shard is None and replicate is None:
+            raise ValueError(
+                "dp_mode='hsdp' requires fsdp_degree and/or "
+                "dp_replicate_degree to build the 2-D (dp_replicate, fsdp) mesh"
+            )
+        if shard is None:
+            if world_size % replicate != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) not divisible by "
+                    f"dp_replicate_degree ({replicate})"
+                )
+            shard = world_size // replicate
+        if replicate is None:
+            if world_size % shard != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) not divisible by fsdp_degree ({shard})"
+                )
+            replicate = world_size // shard
+        if shard * replicate != world_size:
+            raise ValueError(
+                f"hsdp degrees fsdp_degree={shard} x "
+                f"dp_replicate_degree={replicate} != world_size={world_size}"
+            )
+        return shard, replicate
 
     def _build_pass_kwargs(self) -> dict:
         """
@@ -221,10 +465,13 @@ class GraphCompiler:
 
         if self.pass_config.fsdp_enabled:
             kwargs["fsdp_group_name"] = "fsdp"
+            # DDP / HSDP also reduce gradients on the replicate axis.
+            if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
+                kwargs["dp_replicate_group_name"] = "dp_replicate"
 
         return kwargs
 
-    def _run_graph(self, input_batch, label_batch):
+    def _run_graph(self, **inputs):
         """Execute compiled graph"""
         if self._joint_graph is None:
             raise RuntimeError(
@@ -237,8 +484,7 @@ class GraphCompiler:
         return run_traced_graph(
             self._joint_graph,
             self.model,
-            input_batch,
-            label_batch,
+            inputs,
         )
 
     def _accumulate_grads(self, grads: List[torch.Tensor]) -> None:

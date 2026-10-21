@@ -18,7 +18,7 @@ __all__ = ["CheckpointerCallback"]
 
 import os
 import random
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 
@@ -30,13 +30,17 @@ from hyper_parallel.components.checkpoint.dcp_checkpointer import (
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
     MixedPrecisionOptimizer,
 )
+from hyper_parallel.core.distributed_checkpoint.utils import flatten_state_dict
+from hyper_parallel.models._transformers.model_builder import (
+    validate_model_init_dtype,
+)
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import empty_cache
 from hyper_parallel.trainer.runtime.device import (
     get_device_rng_state,
     set_device_rng_state,
 )
-from hyper_parallel.models._transformers.model_builder import apply_model_init_dtype
+from hyper_parallel.models.external_state import CheckpointRuntime, get_model_external_state
 from .base import Callback, TrainerState
 
 
@@ -52,6 +56,12 @@ def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
     return list(value) if isinstance(value, list) else [value]
+
+
+def _state_leaf_keys(value: Any) -> frozenset[str]:
+    """Use DCP's own traversal to list persisted dense optimizer leaves."""
+    flat, _ = flatten_state_dict({"optimizer": value})
+    return frozenset(key.removeprefix("optimizer.") for key in flat)
 
 
 def _unwrap_single(values: List[Any]) -> Any:
@@ -105,6 +115,18 @@ class CheckpointerCallback(Callback):
         self._restore_from = ckpt_cfg.restore_from
         self._restore_optimizer = ckpt_cfg.restore_optimizer
         self._restore_train_state = ckpt_cfg.restore_train_state
+        self._restore_dataloader_state = ckpt_cfg.restore_dataloader_state
+
+        external = get_model_external_state(getattr(trainer, "model", None))
+        if external is not None:
+            if self._is_async or self._is_peft:
+                raise ValueError("Host external state requires synchronous non-PEFT checkpointing")
+            if self._save_ckpt and (not self._save_optimizer or not self._save_train_state):
+                raise ValueError("Host checkpoint requires optimizer and train-state saving")
+            if self._restore_optimizer != self._restore_train_state:
+                raise ValueError("Host restore requires optimizer and train state together")
+            if trainer.mesh.pp_size > 1 and not self._save_extra_state_per_rank:
+                raise ValueError("Host PP checkpoint requires per-rank extra state")
 
         self._last_saved_step: int = -1
         self.checkpointer = build_checkpointer(
@@ -116,7 +138,11 @@ class CheckpointerCallback(Callback):
     # ------------------------------------------------------------------
 
     def on_train_begin(self, state: TrainerState, **kwargs: Any) -> None:
-        """Log the checkpoint configuration and restore any requested state."""
+        """Log the checkpoint configuration and restore any requested state.
+
+        Args:
+            state: Trainer or external model state.
+        """
         logger.info(
             "Checkpoint configuration: "
             "checkpoint_dir=%s, save_ckpt=%s, save_steps=%s, save_epochs=%s, "
@@ -133,17 +159,27 @@ class CheckpointerCallback(Callback):
         )
         self._load_checkpoint()
 
-    def on_step_end(  # pylint: disable=arguments-differ
-            self, state: TrainerState, **kwargs: Any
-    ) -> None:
-        """Save on the configured step cadence."""
+    def on_step_end(self, state: TrainerState, **kwargs: Any) -> None:  # pylint: disable=arguments-differ
+        """Surface a failed async save, then save on the configured step cadence.
+
+        Args:
+            state: Trainer or external model state.
+        """
+        # Asked every step on purpose. An async save that failed can only be
+        # reported on a thread that cannot raise into this loop, so waiting for the
+        # next save to notice would throw away every step in between.
+        self.checkpointer.raise_for_failed_async_save()
         if self._save_steps > 0 and state.global_step % self._save_steps == 0:
             if state.global_step == self._last_saved_step:
                 return
             self._save_checkpoint(state)
 
     def on_epoch_end(self, state: TrainerState, **kwargs: Any) -> None:
-        """Save on the configured epoch cadence."""
+        """Save on the configured epoch cadence.
+
+        Args:
+            state: Trainer or external model state.
+        """
         if self._save_epochs > 0 and (state.epoch + 1) % self._save_epochs == 0:
             if state.global_step != self._last_saved_step:
                 self._save_checkpoint(state)
@@ -160,6 +196,9 @@ class CheckpointerCallback(Callback):
         Always saved when saving is on and the step is not already on disk:
         losing the last stretch of training to a cadence that happened not to
         land on the final step is never what anyone wants.
+
+        Args:
+            state: Trainer or external model state.
         """
         if (
             self._save_ckpt
@@ -183,6 +222,13 @@ class CheckpointerCallback(Callback):
         """Return the model state to persist, trainable-only under PEFT."""
         model = self.trainer.model
         state_dict = model.state_dict()
+        external = get_model_external_state(model)
+        if external is not None:
+            missing = set(external.parameters) - set(state_dict)
+            if missing:
+                raise RuntimeError(f"External model FQNs missing from state_dict: {sorted(missing)}")
+            state_dict = {key: value for key, value in state_dict.items()
+                          if key not in external.parameters}
         if not self._is_peft:
             return state_dict
 
@@ -219,20 +265,22 @@ class CheckpointerCallback(Callback):
             },
         }
 
-    def _steps_per_epoch(self) -> int:
-        """Return the optimizer steps one epoch contains.
+    def _resume_position(self) -> Tuple[int, int]:
+        """Return the ``(epoch, step)`` position the training loop resumes from.
 
-        ``trainer.train_steps`` is the *run total* (``steps_per_epoch *
-        num_train_epochs``), so mapping a restored ``global_step`` back onto an
-        ``(epoch, step)`` position needs the per-epoch count, which is the
-        dataloader's length. An unsized (streaming) loader has no epoch boundary
-        of its own, so the run total stands in for it.
+        Read off the same two values the loops use rather than re-derived from
+        ``global_step``: they re-enter ``state.epoch`` and skip the optimizer steps
+        its predecessors consumed, and ``state.epoch`` is restored from the
+        checkpoint. Dividing ``global_step`` instead would be a second answer that
+        can disagree with the loop, and it would have to divide by
+        ``train_steps`` --- the optimizer steps one epoch holds --- not by the
+        dataloader's length, which counts micro-batches.
+
+        Returns:
+            The epoch training resumes in, and its offset within that epoch.
         """
-        try:
-            steps_per_epoch = len(self.trainer.train_dataloader)
-        except TypeError:
-            steps_per_epoch = 0
-        return max(steps_per_epoch or int(self.trainer.train_steps or 0), 1)
+        state = self.trainer.state
+        return state.epoch, state.global_step - state.epoch * self.trainer.train_steps
 
     # ------------------------------------------------------------------
     # Save
@@ -262,6 +310,26 @@ class CheckpointerCallback(Callback):
             )
         if self._save_train_state:
             checkpoint_state["extra_state"] = self._collect_extra_state(state)
+
+        external = get_model_external_state(self.trainer.model)
+        if external is not None:
+            persisted_keys = (_state_leaf_keys(checkpoint_state["optimizer"])
+                              if "optimizer" in checkpoint_state else frozenset())
+            external.before_checkpoint_save(CheckpointRuntime(
+                step_dir=save_dir, global_step=state.global_step,
+                mesh_context=self.trainer.mesh,
+                include_optimizer=self._save_optimizer,
+                include_train_state=self._save_train_state,
+                persisted_optimizer_keys=persisted_keys,
+            ))
+
+        model_integration = getattr(self.trainer, "model_integration", None)
+        if model_integration is not None:
+            model_integration.capture_checkpoint_payload(
+                "before_save",
+                save_dir,
+                checkpoint_state,
+            )
 
         self.checkpointer.save(
             save_dir,
@@ -306,17 +374,12 @@ class CheckpointerCallback(Callback):
             raise FileNotFoundError(f"Checkpoint directory not found: {restore_path}")
         return restore_path
 
-    def _load_checkpoint(self) -> None:
-        """Restore a checkpoint into the trainer's live objects."""
-        restore_path = self._resolve_restore_path()
-        if restore_path is None:
-            return
-
-        logger.info("Loading checkpoint from %s", restore_path)
-
+    def _build_restore_skeleton(self, restore_path: str, external: Any) -> tuple[Dict[str, Any], List[Any]]:
+        """Initialize lazy dense moments and create the DCP load skeleton."""
         optimizers = _as_list(self.trainer.optimizer) if self._restore_optimizer else []
         for optimizer in optimizers:
-            if not initialize_optimizer_state(optimizer):
+            target = external.optimizer_for_dcp() if external is not None else optimizer
+            if not initialize_optimizer_state(target):
                 logger.warning(
                     "Could not materialize optimizer state before loading; "
                     "optimizer moments may not be restored from %s.",
@@ -328,6 +391,82 @@ class CheckpointerCallback(Callback):
             checkpoint_state["optimizer"] = _unwrap_single(
                 [optimizer.state_dict() for optimizer in optimizers]
             )
+        return checkpoint_state, optimizers
+
+    def _load_optimizer_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
+                                persisted_keys: Optional[frozenset[str]]) -> None:
+        """Restore dense optimizer leaves or reload dense main parameters."""
+        optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
+        for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
+            optimizer.load_state_dict(optimizer_sd)
+            drop_primed = getattr(optimizer, "drop_unpersisted_dense_state", None)
+            if drop_primed is not None and persisted_keys is not None:
+                drop_primed(persisted_keys)
+        if not optimizers:
+            for optimizer in _as_list(self.trainer.optimizer):
+                if isinstance(optimizer, MixedPrecisionOptimizer):
+                    optimizer.reload_model_params()
+
+    def _apply_restored_payload(self, checkpoint_state: Dict[str, Any], optimizers: List[Any],
+                                external: Any, runtime: Any, restore_path: str,
+                                load_plan: Any) -> None:
+        """Install the loaded dense and external model, optimizer, and train state."""
+        if external is not None:
+            full_model_keys = set(self.trainer.model.state_dict())
+            dense_model_keys = set(checkpoint_state["model"])
+            if full_model_keys - dense_model_keys != set(external.parameters):
+                raise RuntimeError("Dense checkpoint model keys differ from exact external exclusions")
+        load_result = self.trainer.model.load_state_dict(
+            checkpoint_state["model"], strict=not self._is_peft and external is None
+        )
+        if external is not None and load_result is not None and (
+                set(load_result.missing_keys) != set(external.parameters)
+                or load_result.unexpected_keys):
+            raise RuntimeError("Dense checkpoint model keys differ from exact external exclusions")
+        validate_model_init_dtype(
+            self.trainer.model,
+            self.trainer.config.model_init_dtype,
+        )
+        persisted_keys = load_plan.persisted_optimizer_keys if load_plan is not None else None
+        self._load_optimizer_payload(checkpoint_state, optimizers, persisted_keys)
+
+        if self._restore_train_state:
+            self._apply_extra_state(checkpoint_state["extra_state"])
+        else:
+            logger.info(
+                "restore_train_state=False: loaded weights only from %s "
+                "(step, scheduler, dataloader and RNG start fresh).",
+                restore_path,
+            )
+
+        if external is not None:
+            external.after_checkpoint_load(runtime, load_plan)
+            if not self._restore_optimizer:
+                dense = external.optimizer_for_dcp()
+                if isinstance(dense, MixedPrecisionOptimizer):
+                    dense.reload_model_params()
+                external.after_weights_only_load()
+
+    def _load_checkpoint(self) -> None:
+        """Restore a checkpoint into the trainer's live objects."""
+        restore_path = self._resolve_restore_path()
+        if restore_path is None:
+            return
+
+        logger.info("Loading checkpoint from %s", restore_path)
+        external = get_model_external_state(self.trainer.model)
+        runtime = None
+        load_plan = None
+        if external is not None:
+            runtime = CheckpointRuntime(
+                step_dir=restore_path, global_step=None,
+                mesh_context=self.trainer.mesh,
+                include_optimizer=self._restore_optimizer,
+                include_train_state=self._restore_train_state,
+            )
+            load_plan = external.before_checkpoint_load(runtime)
+
+        checkpoint_state, optimizers = self._build_restore_skeleton(restore_path, external)
 
         # The skeleton gives an embedded extra_state bundle keys to be read into;
         # the checkpointer decides whether it is actually needed for this layout.
@@ -343,54 +482,44 @@ class CheckpointerCallback(Callback):
             strict_model=not self._is_peft,
             extra_state_skeleton=extra_state_skeleton,
         )
-
-        self.trainer.model.load_state_dict(
-            checkpoint_state["model"], strict=not self._is_peft
-        )
-        apply_model_init_dtype(
-            self.trainer.model,
-            self.trainer.config.model_init_dtype,
-        )
-        # ``checkpoint_state["optimizer"]`` was built from ``optimizers`` above
-        # and DCP only fills that skeleton's existing tensor leaves in place ---
-        # it never adds or removes list entries. The checkpoint planner reports
-        # missing persisted optimizer entries during ``checkpointer.load()``.
-        optimizer_sds = _as_list(checkpoint_state.get("optimizer"))
-        for optimizer, optimizer_sd in zip(optimizers, optimizer_sds):
-            optimizer.load_state_dict(optimizer_sd)
-        if not optimizers:
-            for optimizer in _as_list(self.trainer.optimizer):
-                if isinstance(optimizer, MixedPrecisionOptimizer):
-                    optimizer.reload_model_params()
-
-        if self._restore_train_state:
-            self._apply_extra_state(checkpoint_state["extra_state"])
-        else:
-            logger.info(
-                "restore_train_state=False: loaded weights only from %s "
-                "(step, scheduler, dataloader and RNG start fresh).",
+        if load_plan is not None and self._restore_optimizer:
+            missing_optimizer_keys = (load_plan.persisted_optimizer_keys
+                                      - _state_leaf_keys(checkpoint_state["optimizer"]))
+            if missing_optimizer_keys:
+                raise RuntimeError(f"Dense optimizer skeleton lost persisted keys: {sorted(missing_optimizer_keys)}")
+        model_integration = getattr(self.trainer, "model_integration", None)
+        if model_integration is not None:
+            model_integration.capture_checkpoint_payload(
+                "after_load",
                 restore_path,
+                checkpoint_state,
             )
 
+        self._apply_restored_payload(
+            checkpoint_state, optimizers, external, runtime, restore_path,
+            load_plan,
+        )
+
         empty_cache()
+        # Computed here because this log is the only consumer: the training loops
+        # derive their own starting position from ``state`` instead, so carrying it
+        # on the trainer would be state nobody reads.
+        start_epoch, start_step = self._resume_position()
         logger.info(
             "Checkpoint loaded successfully: path=%s, global_step=%s, "
             "start_epoch=%s, start_step=%s",
             restore_path,
             self.trainer.state.global_step,
-            self.trainer.start_epoch,
-            self.trainer.start_step,
+            start_epoch,
+            start_step,
         )
 
     def _apply_extra_state(self, extra: Dict[str, Any]) -> None:
         """Restore progress, scheduler, dataloader position and RNG state."""
         trainer = self.trainer
         trainer.state.global_step = extra["global_step"]
-        trainer.state.epoch = extra.get("epoch", 0)
-
-        steps_per_epoch = self._steps_per_epoch()
-        trainer.start_epoch = trainer.state.global_step // steps_per_epoch
-        trainer.start_step = trainer.state.global_step % steps_per_epoch
+        persisted_epoch = extra.get("epoch", 0)
+        trainer.state.epoch = persisted_epoch
 
         # The restored step is already on disk. Without this, resuming a run that
         # had nothing left to do would have ``on_train_end`` rewrite the very
@@ -415,7 +544,12 @@ class CheckpointerCallback(Callback):
                 scheduler.load_state_dict(scheduler_sd)
 
         dataloader_sd = extra.get("train_dataloader")
-        if dataloader_sd and hasattr(trainer.train_dataloader, "load_state_dict"):
+        if dataloader_sd and not self._restore_dataloader_state:
+            logger.info(
+                "restore_dataloader_state=False: retaining the configured "
+                "dataloader start instead of restoring its checkpoint cursor."
+            )
+        elif dataloader_sd and hasattr(trainer.train_dataloader, "load_state_dict"):
             trainer.train_dataloader.load_state_dict(dataloader_sd)
         elif dataloader_sd:
             logger.warning(

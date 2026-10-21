@@ -14,18 +14,21 @@
 # ============================================================================
 """Consistency-only patches for the pinned vLLM-Ascend runtime."""
 
+__all__ = ["install_partial_prefill_rng_fix", "patch_partial_prefill_rng"]
+
+
 # The pinned vLLM runner exposes partial-prefill sampling only through these private hooks.
 # pylint: disable=protected-access
 from functools import wraps
 from typing import Any
 
 
-_PRE_SAMPLE_GENERATOR_OFFSETS = "_hyper_rl_pre_sample_generator_offsets"
+_PRE_SAMPLE_GENERATOR_OFFSETS = "_rl_pre_sample_generator_offsets"
 
 
 def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
     """Restore seeded generators after vLLM discards partial-prefill samples."""
-    if getattr(model_runner_cls, "_hyper_rl_partial_prefill_rng_patched", False):
+    if getattr(model_runner_cls, "_rl_partial_prefill_rng_patched", False):
         return
     original_sample = model_runner_cls._sample
     original_bookkeeping = model_runner_cls._bookkeeping_sync
@@ -81,7 +84,7 @@ def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
 
     model_runner_cls._sample = capture_offsets
     model_runner_cls._bookkeeping_sync = restore_discarded_offsets
-    model_runner_cls._hyper_rl_partial_prefill_rng_patched = True
+    model_runner_cls._rl_partial_prefill_rng_patched = True
 
 
 def install_partial_prefill_rng_fix() -> None:
@@ -93,6 +96,3 @@ def install_partial_prefill_rng_fix() -> None:
     except ImportError as error:
         raise ValueError(f"vLLM-Ascend model runner is unavailable: {error}") from error
     patch_partial_prefill_rng(NPUModelRunner)
-
-
-__all__ = ["install_partial_prefill_rng_fix", "patch_partial_prefill_rng"]

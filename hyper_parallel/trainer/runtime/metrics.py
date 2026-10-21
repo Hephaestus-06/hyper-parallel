@@ -15,15 +15,39 @@
 
 from __future__ import annotations
 
+__all__ = ["mean_global_loss"]
+
 from typing import TYPE_CHECKING, Union
 
 import torch
 import torch.distributed as dist
 
+from hyper_parallel.core.utils.communication import (
+    _is_tracing_or_compiling,
+    differentiable_all_reduce,
+)
 from hyper_parallel.trainer.runtime.distributed import all_reduce
 
 if TYPE_CHECKING:
     from hyper_parallel.distributed.mesh import MeshContext
+
+
+def _reduce_weighted_loss(cur_loss, cur_token_len, all_reduced_len, loss_name, device_mesh, dp_cp_group):
+    """Reduce a token-weighted loss while preserving the local backward graph."""
+    if all_reduced_len != 0:
+        local_weighted_loss = cur_loss * cur_token_len
+        backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
+        global_weighted_loss = all_reduce(
+            local_weighted_loss.detach().item(),
+            op="sum",
+            group=dp_cp_group,
+        )
+        global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
+        return backward_loss + global_mean - backward_loss.detach()
+
+    if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
+        raise ValueError(f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}")
+    return cur_loss
 
 
 def mean_global_loss(
@@ -69,7 +93,36 @@ def mean_global_loss(
 
         cur_token_len = current_token_counts[f"{loss_name}_tokens"]
         if sequence_parallel:
-            cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
+            if _is_tracing_or_compiling():
+                # Graph tracing: ``.item()`` is data-dependent and unsupported
+                # by the static-shape tracer; aggregate on tensors instead.
+                cur_token_len = differentiable_all_reduce(
+                    cur_token_len, "sum", sequence_parallel_group
+                )
+            else:
+                cur_token_len = all_reduce(cur_token_len.item(), op="sum", group=sequence_parallel_group)
+
+        if _is_tracing_or_compiling():
+            # Graph-traced variant of the aggregation below: identical math
+            # expressed with tensor collectives so the static-shape tracer can
+            # capture it (no ``.item()``, no data-dependent zero-token guard).
+            # ``differentiable_all_reduce`` dispatches to functional collectives
+            # under tracing. BaseTrainer passes token-count tensors as explicit
+            # graph inputs so packed/ignored-token counts remain live.
+            step_len = differentiable_all_reduce(
+                step_token_counts[f"{loss_name}_tokens"], "sum", dp_cp_group
+            )
+            local_weighted_loss = cur_loss * cur_token_len
+            backward_loss = local_weighted_loss / step_len * device_mesh.dp_size * device_mesh.cp_size
+            global_weighted_loss = differentiable_all_reduce(
+                local_weighted_loss.detach(), "sum", dp_cp_group
+            )
+            global_mean = global_weighted_loss / step_len
+            cur_loss = backward_loss + global_mean - backward_loss.detach()
+            if sequence_parallel:
+                cur_loss = cur_loss / sequence_parallel_size
+            loss_dict[key] = cur_loss
+            continue
 
         all_reduced_len = all_reduce(
             step_token_counts[f"{loss_name}_tokens"].item(),
@@ -77,21 +130,14 @@ def mean_global_loss(
             group=dp_cp_group,
         )
 
-        if all_reduced_len != 0:
-            local_weighted_loss = cur_loss * cur_token_len
-            backward_loss = local_weighted_loss / all_reduced_len * device_mesh.dp_size * device_mesh.cp_size
-            global_weighted_loss = all_reduce(
-                local_weighted_loss.detach().item(),
-                op="sum",
-                group=dp_cp_group,
-            )
-            global_mean = cur_loss.new_tensor(global_weighted_loss / all_reduced_len)
-            cur_loss = backward_loss + global_mean - backward_loss.detach()
-        else:
-            if not torch.allclose(cur_loss, torch.zeros_like(cur_loss)):
-                raise ValueError(
-                    f"The all_reduced_len for {loss_name}_tokens is 0, but the cur_loss is not 0: {cur_loss}"
-                )
+        cur_loss = _reduce_weighted_loss(
+            cur_loss,
+            cur_token_len,
+            all_reduced_len,
+            loss_name,
+            device_mesh,
+            dp_cp_group,
+        )
 
         if sequence_parallel:
             cur_loss = cur_loss / sequence_parallel_size
@@ -99,6 +145,3 @@ def mean_global_loss(
         loss_dict[key] = cur_loss
 
     return loss_dict
-
-
-__all__ = ["mean_global_loss"]

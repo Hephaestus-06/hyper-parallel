@@ -16,12 +16,24 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "all_gather",
+    "barrier",
+    "empty",
+    "free",
+    "get",
+    "host_barrier",
+    "put",
+    "signal",
+    "wait_signal",
+]
+
 import operator
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from ._debug import _log_allocation_site
-from ._lifecycle import _host_barrier
+from ._lifecycle import _host_barrier, _runtime_access
 from ._runtime import _load_native, _torch_modules
 
 if TYPE_CHECKING:
@@ -61,6 +73,7 @@ def _normalize_alignment(alignment: Any | None) -> int | None:
         raise TypeError(f"alignment must be an integer, got {type(alignment).__name__}") from error
 
 
+@_runtime_access
 def empty(
     *size: int | Sequence[int],
     dtype: torch.dtype | None = None,
@@ -69,8 +82,8 @@ def empty(
     """Collectively allocate one contiguous Tensor from the Root WORLD symmetric Heap.
 
     Args:
-        size: Torch-style variadic dimensions or one dimension sequence.
-        dtype: Tensor dtype; ``None`` uses Torch's default dtype.
+        size: Variadic dimensions or one dimension sequence.
+        dtype: Tensor dtype; ``None`` uses the framework default dtype.
         alignment: Optional Allocation-base alignment in Byte.
 
     Returns:
@@ -97,6 +110,7 @@ def empty(
     return tensor
 
 
+@_runtime_access
 def free(tensor: torch.Tensor) -> None:
     """Collectively release one complete symmetric Allocation after Stream quiescence.
 
@@ -122,6 +136,7 @@ def free(tensor: torch.Tensor) -> None:
     _load_native()._free(tensor)  # pylint: disable=protected-access
 
 
+@_runtime_access
 def barrier(*, blocking: bool = True) -> None:
     """Enqueue a Root WORLD barrier on the current NPU Stream.
 
@@ -144,14 +159,15 @@ def barrier(*, blocking: bool = True) -> None:
     _load_native()._barrier(blocking=blocking)  # pylint: disable=protected-access
 
 
+@_runtime_access
 def host_barrier() -> None:
     """Complete a host-synchronous HCCL barrier over the acquired Root group.
 
     Unlike :func:`barrier`, this call blocks the Host until every Root PE has arrived and the device work enqueued
-    earlier on the calling thread's current stream is complete (torch_npu enqueues the HCCL barrier on the current
+    earlier on the calling thread's current stream is complete (the backend enqueues the HCCL barrier on the current
     stream). Work enqueued on other streams is NOT covered: the caller must synchronize those streams
     (``stream.synchronize()``) before calling. It does not use the SHMEM device barrier. A one-PE Root
-    (torch.distributed not initialized or world size 1) is a no-op.
+    (distributed communication not initialized or world size 1) is a no-op.
 
     Raises:
         RuntimeError: If no SHMEM reference is active.
@@ -162,6 +178,7 @@ def host_barrier() -> None:
     _host_barrier()
 
 
+@_runtime_access
 def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> None:
     """Enqueue a byte-for-byte Put to one Root WORLD PE.
 
@@ -180,6 +197,7 @@ def put(remote_dst: torch.Tensor, local_src: torch.Tensor, target_pe: int) -> No
     _load_native()._put(remote_dst, local_src, target_pe)  # pylint: disable=protected-access
 
 
+@_runtime_access
 def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int) -> None:
     """Enqueue a byte-for-byte Get from one Root WORLD PE.
 
@@ -198,6 +216,7 @@ def get(local_dst: torch.Tensor, remote_src: torch.Tensor, source_pe: int) -> No
     _load_native()._get(local_dst, remote_src, source_pe)  # pylint: disable=protected-access
 
 
+@_runtime_access
 def signal(remote_signal: torch.Tensor, value: int, target_pe: int, *, operation: str = "set") -> None:
     """Enqueue a Set or Add update to one symmetric Signal.
 
@@ -224,6 +243,7 @@ def signal(remote_signal: torch.Tensor, value: int, target_pe: int, *, operation
     )
 
 
+@_runtime_access
 def wait_signal(
     signal_tensor: torch.Tensor,
     value: int,
@@ -250,6 +270,7 @@ def wait_signal(
     )
 
 
+@_runtime_access
 def all_gather(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
     """Enqueue a Root WORLD AllGather using symmetric ``output`` storage.
 
@@ -269,16 +290,3 @@ def all_gather(output: torch.Tensor, input_tensor: torch.Tensor) -> None:
         concurrently with this call.
     """
     _load_native()._all_gather(output, input_tensor)  # pylint: disable=protected-access
-
-
-__all__ = [
-    "all_gather",
-    "barrier",
-    "empty",
-    "free",
-    "get",
-    "host_barrier",
-    "put",
-    "signal",
-    "wait_signal",
-]

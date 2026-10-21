@@ -18,15 +18,22 @@ Split from ``auto_models/trainer/config.py`` in stage 7 (05 §15.2.5).
 ``PlanOverride`` stays the YAML DTO that desugars to
 ``auto_models.distributed.recipe_spec.ModuleShardingSpec``.
 """
+# pylint: disable=unused-import
 
 import importlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, List, Literal, Optional, Union
 
 from torch import nn  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.config import (
+    LowPrecisionConfig,
+    LowPrecisionDtypeScheme,
+)
+from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -48,6 +55,85 @@ class AcceleratorConfig:
     pp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
+
+
+@dataclass
+class ActivationCheckpointSelection:
+    """Select adapter-declared recompute regions and exact layer coverage.
+
+    ``layer_count`` selects the contiguous prefix ``[0, layer_count)`` from
+    the flattened layer-container order. ``layer_indices`` selects explicit
+    zero-based entries from that same order.
+
+    ``model_adapter_safe_regions`` wraps the outermost module matching the
+    adapter's ``region_patterns`` inside every selected layer and keeps every
+    ``exclude_patterns`` descendant outside the recompute region. Which shape that
+    produces is the model's declaration, not the Trainer's: leaf patterns give
+    one region per submodule, a layer pattern gives one region per layer.
+    """
+
+    source: Literal["default", "model_adapter_safe_regions"] = "default"
+    layer_count: Optional[int] = None
+    layer_indices: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        """Validate the mutually exclusive layer-count and layer-index selectors."""
+        self._validate_selector_choice()
+        self._validate_selector_values()
+
+    def _validate_selector_choice(self) -> None:
+        """Require one supported source and its matching selector form."""
+        if self.source not in ("default", "model_adapter_safe_regions"):
+            raise ValueError(
+                "activation_checkpoint.selection.source must be default or "
+                "model_adapter_safe_regions"
+            )
+        selectors = (self.layer_count is not None, self.layer_indices is not None)
+        if self.source == "default" and any(selectors):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count and layer_indices "
+                "are only valid when "
+                "selection.source=model_adapter_safe_regions"
+            )
+        if self.source == "model_adapter_safe_regions" and sum(selectors) != 1:
+            raise ValueError(
+                "activation_checkpoint.selection requires exactly one of "
+                "layer_count or layer_indices when "
+                "selection.source=model_adapter_safe_regions"
+            )
+
+    def _validate_selector_values(self) -> None:
+        """Require non-negative, distinct layer numbers."""
+        if self.layer_count is not None and (
+            isinstance(self.layer_count, bool)
+            or not isinstance(self.layer_count, int)
+            or self.layer_count < 0
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_count must be a "
+                "non-negative integer"
+            )
+        if self.layer_indices is None:
+            return
+        if not isinstance(self.layer_indices, list) or not self.layer_indices:
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must be a "
+                "non-empty list of non-negative integers"
+            )
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in self.layer_indices
+        ):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must contain "
+                "only non-negative integers"
+            )
+        if len(set(self.layer_indices)) != len(self.layer_indices):
+            raise ValueError(
+                "activation_checkpoint.selection.layer_indices must not "
+                "contain duplicates"
+            )
 
 
 @dataclass
@@ -60,11 +146,22 @@ class ActivationCheckpointConfig:
 
     mode: Optional[Literal["off", "full", "selective"]] = "off"
     swap_inputs: bool = False
+    selection: ActivationCheckpointSelection = field(
+        default_factory=ActivationCheckpointSelection
+    )
+    # Escape hatch for SAC's cached-tensor mutation check: safe when
+    # every in-place rewrite of a cached operator output is
+    # deterministic, so the recompute replays the same values (the
+    # CSA indexer's masked_fill_ family).
+    allow_cache_entry_mutation: bool = False
 
     def __post_init__(self) -> None:
         """Reject ambiguous values for activation input swapping."""
         if not isinstance(self.swap_inputs, bool):
             raise TypeError("activation_checkpoint.swap_inputs must be a bool")
+        if not isinstance(self.allow_cache_entry_mutation, bool):
+            raise TypeError(
+                "activation_checkpoint.allow_cache_entry_mutation must be a bool")
 
 
 @dataclass
@@ -88,14 +185,24 @@ class PlanOverride:
             It receives ``module``, ``module_fqn``, and a read-only context,
             and must return a structure-preserving replacement. A list
             ``match`` is supported only for replacement-only entries.
-        match: fqn or fqn glob matched (fnmatchcase) against the plan's
-            boundary FQNs — ``*`` spans dots, so ``"*.self_attn"`` hits
+        match: fqn or fqn glob. Globs first merge matching planner boundaries;
+            a glob with a concrete params/I/O contract also expands against
+            the final model's ``named_modules`` and creates missing boundaries.
+            A merge-only glob fails if it matches a real module that has no
+            planner boundary, with a suggested contract skeleton.
+            ``*`` spans dots, so ``"*.self_attn"`` hits
             ``model.layers.0.self_attn``.
         when: optional activation condition. Sharding actions accept ``"cp"``
-            (active when cp_size>1), ``"ep"`` (ep_size>1), or
-            ``"low_precision"`` (active when online low precision is
-            enabled). A replacement action accepts only ``"low_precision"``;
-            module replacement must not depend on the parallel topology.
+            (active when cp_size>1), ``"ep"`` (ep_size>1),
+            ``"sequence_parallel"``, or ``"low_precision"`` (active when
+            online low precision is enabled). A replacement action accepts
+            only ``"low_precision"``; module replacement must not depend on
+            the parallel topology.
+        low_precision_dtype_scheme: a named ``training.low_precision.
+            dtype_schemes`` entry bound to this match. Only valid on
+            ``when="low_precision"`` replacement entries; the resolved scheme
+            is injected into the replacement factory context so the strategy
+            factory never resolves a catalog at replacement time.
         local_compute_fn: a Target whose callable is a **factory** — must be
             decorated ``@local_compute`` (injection discipline); the mesh
             family ``mesh``/``tp_mesh``/``cp_mesh``/``ep_mesh`` is mandatory
@@ -155,8 +262,11 @@ class PlanOverride:
             YAML form ``{name: {axis: placement_str}}`` (out_* also accept
             the scalar shorthand ``{axis: placement_str}``), or the sentinels
             ``"auto"`` / ``"none"``. Merge mode (match hits a derived
-            boundary): usually omitted — empty inherits the derived contract;
-            insert mode (misses every boundary): all must be fully declared.
+            boundary): an omitted field inherits and an explicit ``{}``
+            clears. Insert mode (misses every boundary): nothing can inherit;
+            at least one concrete parameter/I/O field must declare the new
+            boundary, and all fields required by that module's contract must
+            be written explicitly.
         tp_divide_attrs: optional module-instance integer attributes divided
             exactly by the active TP size when the module forward runs on
             local tensors. Omit for no user adjustment; an explicit empty
@@ -164,7 +274,10 @@ class PlanOverride:
     """
 
     match: Union[str, List[str]]
-    when: Optional[Literal["cp", "ep", "low_precision"]] = None
+    when: Optional[Literal[
+        "cp", "ep", "sequence_parallel", "low_precision"
+    ]] = None
+    low_precision_dtype_scheme: Optional[str] = None
     module_type: Optional[str] = None
     exact_type: bool = False
     replace_module: Optional[Target[Any]] = None
@@ -303,7 +416,7 @@ class PlanOverride:
         }
 
 
-_WHEN_CONDITIONS = ("cp", "ep", "low_precision")
+_WHEN_CONDITIONS = ("cp", "ep", "sequence_parallel", "low_precision")
 
 
 def _import_module_type(path: str) -> type:
@@ -338,7 +451,10 @@ def _import_module_type(path: str) -> type:
     raise ValueError(f"plan_overrides.module_type {path!r} could not be imported")
 
 
-def _target_replacement_factory(target: Target[Any]) -> ModuleReplacementFactory:
+def _target_replacement_factory(
+    target: Target[Any],
+    low_precision_policy: Optional[LowPrecisionDtypeScheme] = None,
+) -> ModuleReplacementFactory:
     """Bind a YAML Target's static args to the replacement factory protocol."""
 
     if not getattr(target._target_, "_hp_module_replacement", False):  # pylint: disable=protected-access
@@ -355,6 +471,10 @@ def _target_replacement_factory(target: Target[Any]) -> ModuleReplacementFactory
         context: Mapping[str, Any],
     ) -> nn.Module:
         """Build one replacement module by delegating to the bound YAML Target."""
+        if low_precision_policy is not None:
+            factory_context = dict(context)
+            factory_context["low_precision"] = low_precision_policy
+            context = MappingProxyType(factory_context)
         return target.build(module=module, module_fqn=module_fqn, context=context)
 
     return factory
@@ -364,34 +484,32 @@ def entries_to_module_replacements(
     entries: List[PlanOverride],
     *,
     low_precision_enabled: bool = False,
+    low_precision_config: Optional[LowPrecisionConfig] = None,
 ) -> tuple[ModuleReplacementSpec, ...]:
-    """Desugar active YAML replacement actions without involving sharding."""
+    """Desugar replacement actions and bind their named dtype schemes.
 
+    Args:
+        entries: Raw planner override entries.
+        low_precision_enabled: Whether low-precision replacement is active.
+        low_precision_config: Named dtype schemes for active replacements.
+    """
+
+    effective_config = low_precision_config if low_precision_enabled else None
     rules = []
     for entry in entries:
         if entry.replace_module is None:
             continue
-        if entry.when not in (None, "low_precision"):
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace_module and "
-                "does not support 'when' values other than 'low_precision' "
-                "(module replacements are not conditioned on parallel topology)"
-            )
         if entry.when == "low_precision" and not low_precision_enabled:
             continue
-        if entry.module_type is None:
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
-            )
-        if not isinstance(entry.replace_module, Target):
-            raise TypeError(
-                f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
-            )
+        _validate_replacement_entry(entry, effective_config)
         patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
+        policy = None
+        if entry.when == "low_precision" and effective_config is not None:
+            policy = effective_config.resolve_dtype_scheme(entry.low_precision_dtype_scheme)
         rules.append(
             ModuleReplacementSpec(
                 match=patterns,
-                factory=_target_replacement_factory(entry.replace_module),
+                factory=_target_replacement_factory(entry.replace_module, policy),
                 module_type=_import_module_type(entry.module_type),
                 exact_type=entry.exact_type,
             )
@@ -399,14 +517,48 @@ def entries_to_module_replacements(
     return tuple(rules)
 
 
-def _has_sharding_action(entry: PlanOverride) -> bool:
-    return any(
-        getattr(entry, name) is not None
-        for name in (
-            "local_compute_fn", "inner_target", "inner_wrapper", "inner_out_src",
-            "region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst",
+def _validate_replacement_entry(entry: PlanOverride, effective_config: Optional[LowPrecisionConfig]) -> None:
+    """Validate one replacement before constructing its planner rule."""
+    if entry.when not in (None, "low_precision"):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} uses replace_module and "
+            "does not support 'when' values other than 'low_precision' "
+            "(module replacements are not conditioned on parallel topology)"
         )
+    if entry.low_precision_dtype_scheme is not None and (
+        not isinstance(entry.low_precision_dtype_scheme, str)
+        or not entry.low_precision_dtype_scheme.strip()
+    ):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r}: "
+            "low_precision_dtype_scheme must be a non-empty string"
+        )
+    if entry.low_precision_dtype_scheme is not None and entry.when != "low_precision":
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} sets "
+            "low_precision_dtype_scheme but is not a low-precision entry"
+        )
+    if entry.when == "low_precision" and effective_config is None:
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} enables a low-precision "
+            "replacement but training.low_precision is missing"
+        )
+    if entry.module_type is None:
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
+        )
+    if not isinstance(entry.replace_module, Target):
+        raise TypeError(
+            f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
+        )
+
+
+def _has_sharding_action(entry: PlanOverride) -> bool:
+    action_names = (
+        "local_compute_fn", "inner_target", "inner_wrapper", "inner_out_src",
+        "region_dispatch", "params", "in_src", "in_dst", "out_src", "out_dst",
     )
+    return any(getattr(entry, name) is not None for name in action_names)
 
 
 def _validate_when(entry: PlanOverride) -> None:
@@ -421,9 +573,17 @@ def _validate_when(entry: PlanOverride) -> None:
 
 def entries_to_plan_overrides(
         entries: "List[PlanOverride]", *, cp_size: int = 1, ep_size: int = 1,
+        sequence_parallel: bool = False,
         low_precision_enabled: bool = False,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
+
+    Args:
+        entries: Raw YAML planner override entries.
+        cp_size: Context-parallel degree.
+        ep_size: Expert-parallel degree.
+        sequence_parallel: Whether decoder sequence parallelism is active.
+        low_precision_enabled: Whether low-precision rules are active.
 
     - ``when`` filter: an entry whose declared condition is inactive
       (``when="cp"`` with cp_size==1 etc.) is SKIPPED with an INFO log —
@@ -457,6 +617,7 @@ def entries_to_plan_overrides(
             active = {
                 "cp": cp_size > 1,
                 "ep": ep_size > 1,
+                "sequence_parallel": sequence_parallel,
                 "low_precision": low_precision_enabled,
             }[entry.when]
             if not active:
@@ -489,6 +650,10 @@ def normalize_distributed_setup_overrides(
 ) -> None:
     """Fill the normalized plan fields of a ``DistributedSetup`` (05 §15.2.6).
 
+    Args:
+        distributed_setup: Mutable setup receiving normalized planner rules.
+        config: Trainer configuration containing raw override entries.
+
     This is the single Trainer-side desugar point: raw YAML ``PlanOverride``
     entries (``TrainerConfig.plan_overrides``) are converted HERE —
     when-filtered against the built mesh and compiled into replacement
@@ -515,12 +680,14 @@ def normalize_distributed_setup_overrides(
     distributed_setup.module_replacements = entries_to_module_replacements(
         entries,
         low_precision_enabled=low_precision_enabled,
+        low_precision_config=getattr(distributed_setup, "low_precision_config", None),
     )
     distributed_setup.plan_overrides = (
         entries_to_plan_overrides(
             entries,
             cp_size=getattr(mesh_context, "cp_size", 1),
             ep_size=getattr(mesh_context, "ep_size", 1),
+            sequence_parallel=getattr(mesh_context, "sequence_parallel", False),
             low_precision_enabled=low_precision_enabled,
         )
         if entries

@@ -40,6 +40,13 @@ from rl.consistency.vllm_ascend import (
 from rl.dataset.contracts import ExperienceBatch
 
 
+@pytest.fixture(autouse=True)
+def legacy_recipe_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the existing recipe tests explicitly pinned to the legacy runtime."""
+    monkeypatch.setattr(profile_module, "package_version",
+                        lambda name: profile_module._EXPECTED_PACKAGE_VERSIONS[name])
+
+
 def test_consistency_profile_installs_shared_recipe_idempotently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,7 +67,7 @@ def test_consistency_profile_installs_shared_recipe_idempotently(
     monkeypatch.setattr(runtime, "installed_rollout_profile", "off")
     monkeypatch.setattr(runtime, "batch_invariant_sum_compatibility_installed", False)
     monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
-    monkeypatch.setattr(profile_module, "_require_package_versions", lambda: None)
+    monkeypatch.setattr(profile_module, "_require_package_versions", lambda _profile: None)
     monkeypatch.setattr(profile_module, "ALL_ATTENTION_FUNCTIONS", FakeRegistry())
     monkeypatch.setattr(
         profile_module,
@@ -225,11 +232,11 @@ def test_partial_prefill_rng_restores_discarded_request_offsets() -> None:
     assert runner._bookkeeping_sync() == "bookkept"
     assert runner.generators[0].offset == 12
     assert runner.generators[1].offset == 0
-    assert getattr(FakeModelRunner, "_hyper_rl_partial_prefill_rng_patched")
+    assert getattr(FakeModelRunner, "_rl_partial_prefill_rng_patched")
 
 
 def test_consistency_configures_complete_qwen3_recipe() -> None:
-    """Production configuration applies the paired Trainer and Hyper-vLLM recipe."""
+    """Production configuration applies the paired Trainer and adapted vLLM recipe."""
     config = {
         "consistency": {"enabled": True},
         "model": {"name": "qwen3"},
@@ -478,7 +485,7 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
         "transformers.models.qwen3.modeling_qwen3",
         SimpleNamespace(Qwen3RMSNorm=RMSNorm),
     )
-    monkeypatch.setattr(profile_module, "_require_package_versions", lambda: None)
+    monkeypatch.setattr(profile_module, "_require_package_versions", lambda _profile: None)
     monkeypatch.setitem(
         sys.modules,
         "flash_attn_npu_v3",
@@ -555,7 +562,7 @@ def test_consistency_validates_model_identity_versions_and_installs_rng_fix(
     """A supported checkpoint and pinned dependency set install the rollout RNG hook."""
     config = {"consistency": {"enabled": True}}
     registration = SimpleNamespace(
-        hyper_model_name="qwen3",
+        builder_model_name="qwen3",
         hf_architecture="Qwen3ForCausalLM",
         model_type="qwen3",
         text_model_type="qwen3",
@@ -583,4 +590,4 @@ def test_consistency_validates_model_identity_versions_and_installs_rng_fix(
     )
     install_partial_prefill_rng_fix()
 
-    assert getattr(Runner, "_hyper_rl_partial_prefill_rng_patched")
+    assert getattr(Runner, "_rl_partial_prefill_rng_patched")
